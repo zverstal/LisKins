@@ -1248,6 +1248,39 @@ function fmtUsd(x, d = 2) {
     return Number.isFinite(v) ? '$' + v.toFixed(d) : '—';
 }
 
+const TG_LIMIT = 4096;
+
+// Режем по пустым строкам между карточками, чтобы не рвать середину
+function splitByTelegramLimit(text, limit = TG_LIMIT - 64) {
+  const blocks = String(text).split(/\n{2,}/); // карточки разделены двумя переводами
+  const out = [];
+  let acc = '';
+  for (const b of blocks) {
+    const p = (acc ? acc + '\n\n' : '') + b;
+    if (p.length <= limit) {
+      acc = p;
+    } else {
+      if (acc) out.push(acc);
+      if (b.length <= limit) {
+        acc = b;
+      } else {
+        // блок слишком большой сам по себе — режем по строкам
+        const lines = b.split('\n');
+        let cur = '';
+        for (const ln of lines) {
+          const q = (cur ? cur + '\n' : '') + ln;
+          if (q.length <= limit) cur = q;
+          else { if (cur) out.push(cur); cur = ln; }
+        }
+        if (cur) { out.push(cur); acc = ''; }
+        else { acc = ''; }
+      }
+    }
+  }
+  if (acc) out.push(acc);
+  return out;
+}
+
 function formatScanMessage(ranked) {
   if (!ranked?.length) return 'Кандидатов не найдено';
 
@@ -1368,9 +1401,16 @@ if (bot) {
             }
 
             const text = formatScanMessage(ranked);
-            await ctx.reply(text, {
-                parse_mode: 'HTML'
-            });
+            
+            const parts = splitByTelegramLimit(text);
+
+        for (let i = 0; i < parts.length; i++) {
+          const suffix = parts.length > 1 ? `\n\n— страница ${i+1}/${parts.length}` : '';
+          await ctx.reply(parts[i] + suffix, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true
+          });
+        }
         } catch (e) {
             await ctx.reply('ai_scan ошибка: ' + (e.response?.status || '') + ' ' + (e.message || ''));
         }
