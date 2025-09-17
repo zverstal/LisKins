@@ -1,0 +1,12 @@
+{
+  "dependencies": {
+    "axios": "^1.12.2",
+    "better-sqlite3": "^12.2.0",
+    "bottleneck": "^2.19.5",
+    "centrifuge": "^5.4.0",
+    "dotenv": "^17.2.2",
+    "grammy": "^1.38.2",
+    "luxon": "^3.7.2",
+    "ws": "^8.18.3"
+  }
+}
