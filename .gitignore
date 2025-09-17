@@ -21,6 +21,10 @@ logs/
 *.sqlite-journal
 *.db
 *.db-journal
+*.db
+*.db-shm
+*.db-wal
+
 
 # OS
 .DS_Store
