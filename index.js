@@ -1313,59 +1313,103 @@ async function aiScanAndMaybeBuy() {
 
 // вспомогалка: безопасно порезать длинный HTML на куски < 4096
 async function sendLongHtml(ctx, html) {
-    const TG_LIMIT = 4096;
-    const LIMIT = TG_LIMIT - 64;
+  const TG_LIMIT = 4096;
+  const LIMIT = TG_LIMIT - 128; // запас на служебный суффикс и сущности
 
-    const chunks = [];
-    const blocks = String(html).split(/\n{2,}/); // режем по «карточкам»
-    let buf = '';
+  const chunks = [];
+  const blocks = String(html).split(/\n{2,}/); // «карточки» через пустые строки
+  let buf = '';
 
-    for (const block of blocks) {
-        const merged = (buf ? buf + '\n\n' : '') + block;
+  const flushBuf = () => {
+    if (!buf) return;
+    chunks.push(buf);
+    buf = '';
+  };
 
-        if (merged.length <= LIMIT) {
-            buf = merged;
-            continue;
-        }
+  for (const block of blocks) {
+    const merged = (buf ? buf + '\n\n' : '') + block;
+    if (merged.length <= LIMIT) { buf = merged; continue; }
 
-        // текущий буфер уже полон — отправляем
-        if (buf) {
-            chunks.push(buf);
-            buf = '';
-        }
+    // текущий буфер уже полный — отправим его
+    flushBuf();
 
-        // если блок сам длиннее лимита — режем по строкам
-        if (block.length > LIMIT) {
-            const lines = block.split('\n');
-            let cur = '';
-            for (const ln of lines) {
-                const candidate = (cur ? cur + '\n' : '') + ln;
-                if (candidate.length <= LIMIT) {
-                    cur = candidate;
-                } else {
-                    if (cur) chunks.push(cur);
-                    cur = ln;
-                }
+    // если блок сам больше лимита — режем аккуратно
+    if (block.length > LIMIT) {
+      const trimmed = block.trim();
+      const isPre = /^<pre>/.test(trimmed) && /<\/pre>$/.test(trimmed);
+
+      if (isPre) {
+        // снимаем обёртку <pre>…</pre> и режем внутренность
+        const inner = trimmed.replace(/^<pre>/, '').replace(/<\/pre>$/, '');
+        const lines = inner.split('\n');
+
+        let cur = '';
+        for (const ln of lines) {
+          const candidate = (cur ? cur + '\n' : '') + ln;
+          if (candidate.length <= LIMIT - '<pre></pre>'.length) {
+            cur = candidate;
+          } else {
+            if (cur) chunks.push(`<pre>${cur}</pre>`);
+            // если одна строка длиннее лимита — режем её «жёстко»
+            if (ln.length > LIMIT - '<pre></pre>'.length) {
+              let s = 0;
+              while (s < ln.length) {
+                const slice = ln.slice(s, s + (LIMIT - '<pre></pre>'.length));
+                chunks.push(`<pre>${slice}</pre>`);
+                s += (LIMIT - '<pre></pre>'.length);
+              }
+              cur = '';
+            } else {
+              cur = ln;
             }
-            if (cur) chunks.push(cur);
-        } else {
-            // блок нормального размера — положим в буфер
-            buf = block;
+          }
         }
+        if (cur) chunks.push(`<pre>${cur}</pre>`);
+      } else {
+        // обычный HTML-блок: режем по строкам без разрыва тегов <pre>
+        const lines = block.split('\n');
+        let cur = '';
+        for (const ln of lines) {
+          const candidate = (cur ? cur + '\n' : '') + ln;
+          if (candidate.length <= LIMIT) {
+            cur = candidate;
+          } else {
+            if (cur) chunks.push(cur);
+            // длиннющую строку нарубим «жёстко»
+            if (ln.length > LIMIT) {
+              let s = 0;
+              while (s < ln.length) {
+                chunks.push(ln.slice(s, s + LIMIT));
+                s += LIMIT;
+              }
+              cur = '';
+            } else {
+              cur = ln;
+            }
+          }
+        }
+        if (cur) chunks.push(cur);
+      }
+    } else {
+      // блок теперь помещается — положим в буфер
+      buf = block;
     }
+  }
 
-    if (buf) chunks.push(buf);
+  flushBuf();
 
-    for (let i = 0; i < chunks.length; i++) {
-        const suffix = chunks.length > 1 ? `\n\n— страница ${i + 1}/${chunks.length}` : '';
-        // важно: parse_mode и отключение превью
-        // eslint-disable-next-line no-await-in-loop
-        await ctx.reply(chunks[i] + suffix, {
-            parse_mode: 'HTML',
-            disable_web_page_preview: true,
-        });
-    }
+  for (let i = 0; i < chunks.length; i++) {
+    const suffix = chunks.length > 1 ? `\n\n— страница ${i + 1}/${chunks.length}` : '';
+    // ВАЖНО: parse_mode=HTML, отключаем превью
+    // eslint-disable-next-line no-await-in-loop
+    await ctx.reply(chunks[i] + suffix, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    });
+  }
 }
+
+
 
 function startAiLoop() {
     if (aiTimer) return;
