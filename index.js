@@ -65,7 +65,10 @@ const CFG = {
     AI_OPENAI_CACHE_TTL_MIN: Number(process.env.AI_OPENAI_CACHE_TTL_MIN || 180),
     AI_CACHE_PRICE_TOL_PCT: Number(process.env.AI_CACHE_PRICE_TOL_PCT || 0.015),
     AI_CACHE_UNLOCK_TOL_H: Number(process.env.AI_CACHE_UNLOCK_TOL_H || 6),
-    AI_ONLY_UNLOCKED_DEFAULT: Number(process.env.AI_ONLY_UNLOCKED_DEFAULT || 0),
+    AI_ONLY_UNLOCKED_DEFAULT: Number(process.env.AI_ONLY_UNLOCKED_DEFAULT || 0),    // Максимум точек ряда и шаг агрегации (не раздувать токены)
+    AI_SERIES_POINTS_MAX: Number(process.env.AI_SERIES_POINTS_MAX || 96),   // до ~4 суток по часу
+    AI_SERIES_STEP_MIN:   Number(process.env.AI_SERIES_STEP_MIN   || 60),   // шаг 60 мин
+
 
 
 
@@ -513,6 +516,79 @@ async function recordMarketSnapshot({
     });
 }
 
+function getPriceSeries(skinName, hoursBack = 168) {
+  const now = Date.now();
+  const sinceIso = new Date(now - hoursBack * 3600 * 1000).toISOString();
+  const rows = db.prepare(`
+    SELECT price, ts FROM price_snapshots
+    WHERE skin_name = ? AND ts >= ?
+    ORDER BY ts ASC
+  `).all(skinName, sinceIso);
+
+  // вернём [{ts:Number(ms), price:Number}]
+  return rows.map(r => ({
+    ts: Date.parse(r.ts),
+    price: Number(r.price)
+  })).filter(p => Number.isFinite(p.ts) && Number.isFinite(p.price));
+}
+
+// Piecewise Aggregate Approximation (PAA)
+// Сжимает ряд до M точек средними по равным сегментам
+function downsamplePAA(series, m) {
+  if (!Array.isArray(series) || series.length === 0) return [];
+  if (series.length <= m) return series; // уже короткий
+  const n = series.length;
+  const out = [];
+  for (let i = 0; i < m; i++) {
+    const start = Math.floor((i    ) * n / m);
+    const end   = Math.floor((i + 1) * n / m);
+    let sumP = 0, sumT = 0, cnt = 0;
+    for (let j = start; j < end; j++) {
+      sumP += series[j].price;
+      sumT += series[j].ts;
+      cnt++;
+    }
+    out.push({ ts: Math.round(sumT / Math.max(1, cnt)), price: sumP / Math.max(1, cnt) });
+  }
+  return out;
+}
+
+// Нормируем в проценты от первой точки (для устойчивости масштаба)
+function toPctFromFirst(series) {
+  if (!series.length) return [];
+  const p0 = series[0].price;
+  if (!Number.isFinite(p0) || p0 <= 0) return series.map(s => ({...s, pct: 0}));
+  return series.map(s => ({ ts: s.ts, pct: (s.price - p0) / p0 }));
+}
+
+// Ресэмплируем «по часу» (или по CFG.AI_SERIES_STEP_MIN) — берём среднюю в бине
+function resampleByStep(series, stepMin = 60) {
+  if (!series.length) return [];
+  const stepMs = stepMin * 60000;
+  const start = series[0].ts;
+  let bucketStart = Math.floor(start / stepMs) * stepMs;
+  let acc = [], out = [];
+  const flush = () => {
+    if (!acc.length) return;
+    const avg = acc.reduce((s, x) => s + x.price, 0) / acc.length;
+    const avgTs = Math.round(acc.reduce((s, x) => s + x.ts, 0) / acc.length);
+    out.push({ ts: avgTs, price: avg });
+    acc = [];
+  };
+
+  for (const p of series) {
+    const b = Math.floor(p.ts / stepMs) * stepMs;
+    if (b !== bucketStart) {
+      flush();
+      bucketStart = b;
+    }
+    acc.push(p);
+  }
+  flush();
+  return out;
+}
+
+
 
 function getPriceChange7d(skinName, hoursBack = 168) {
     const now = Date.now();
@@ -588,200 +664,170 @@ function skinFeatures(it) {
 }
 
 
-async function forecastDirection({
-    skinName,
-    features,
-    allowLLM = true
-}) {
-    const holdHours = (features?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
-    const Hhold_eff = Math.max(0, Math.round((features?.unlock_hours ?? 0) + holdHours));
-    const Hshort = CFG.AI_HORIZON_HOURS_SHORT;
-    const priceUsd = Number(features?.price_usd || 0);
+async function forecastDirection({ skinName, features, allowLLM = true }) {
+  // ── Горизонты и базовые признаки
+  const holdHours  = (features?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
+  const Hhold_eff  = Math.max(0, Math.round((features?.unlock_hours ?? 0) + holdHours));
+  const Hshort     = CFG.AI_HORIZON_HOURS_SHORT;
+  const priceUsd   = Number(features?.price_usd || 0);
 
-    // 7д априорика
-    const ch7 = Number(features?.hist_7d_change_pct ?? 0);
-    const mean7 = Number(features?.hist_7d_mean ?? 0);
-    const std7 = Number(features?.hist_7d_std ?? 0);
-    const n7 = Number(features?.hist_7d_samples ?? 0);
+  // ── 7д априорика (твоя формула)
+  const ch7        = Number(features?.hist_7d_change_pct ?? 0);
+  const mean7      = Number(features?.hist_7d_mean ?? 0);
+  const std7       = Number(features?.hist_7d_std ?? 0);
+  const n7         = Number(features?.hist_7d_samples ?? 0);
 
-    const denom = mean7 > 0 ? mean7 : (priceUsd > 0 ? priceUsd : 1);
-    const cv = Math.max(0, Math.min(1.5, std7 / denom));
-    const slope = 0.8;
-    const maxBps = 0.20;
-    const volPen = 0.10;
+  const denom      = mean7 > 0 ? mean7 : (priceUsd > 0 ? priceUsd : 1);
+  const cv         = Math.max(0, Math.min(1.5, std7 / denom));
+  const slope      = 0.8;
+  const maxBps     = 0.20;
+  const volPen     = 0.10;
 
-    let prior_up = 0.5 + Math.max(-maxBps, Math.min(maxBps, ch7 * slope));
-    prior_up -= volPen * Math.min(1, cv);
-    if (n7 < 6) prior_up = 0.5 * 0.6 + prior_up * 0.4;
-    prior_up = Math.max(0.05, Math.min(0.95, prior_up));
+  let prior_up = 0.5 + Math.max(-maxBps, Math.min(maxBps, ch7 * slope));
+  prior_up    -= volPen * Math.min(1, cv);
+  if (n7 < 6) prior_up = 0.5 * 0.6 + prior_up * 0.4;
+  prior_up     = Math.max(0.05, Math.min(0.95, prior_up));
 
-    const meta = {
-        short_h: Hshort,
-        hold_h: Hhold_eff,
-        price_usd: priceUsd,
-        prior_up,
-        hist_7d: {
-            change_pct: ch7,
-            mean: mean7,
-            std: std7,
-            samples: n7,
-            cv
-        }
-    };
+  // ── Метаданные горизонтов
+  const meta = {
+    short_h:  Hshort,
+    hold_h:   Hhold_eff,
+    price_usd: priceUsd,
+    prior_up,
+    hist_7d: { change_pct: ch7, mean: mean7, std: std7, samples: n7, cv }
+  };
 
-    // 0) попытка достать из кэша
+  // ── 0) Попытка из кэша (с мягким миксом на prior_up)
+  {
     const cached = getCachedForecast(skinName, priceUsd, Hhold_eff, prior_up);
     if (cached) {
-        // подджиттерим, как и прежде
-        const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
-        return jitterForecast({
-            ...cached,
-            horizons: meta
-        }, key);
+      const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
+      const out = { ...cached, horizons: meta };
+      return jitterForecast(out, key);
     }
+  }
 
-    // 1) если LLM отключён или ключа нет — быстрый фоллбек
-    const llmPossible = !!CFG.OPENAI_API_KEY && allowLLM && CFG.AI_LLM_MODE !== 'off';
-    if (!llmPossible) {
-        const out = heuristicForecast({
-            Hshort,
-            Hhold_eff,
-            priceUsd,
-            ch7,
-            prior_up,
-            meta
-        });
-        const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
-        const j = jitterForecast(out, key);
-        putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j);
-        return j;
-    }
+  // ── 1) Если LLM недоступен — быстрый эвристический фоллбек
+  const llmPossible = !!CFG.OPENAI_API_KEY && allowLLM && CFG.AI_LLM_MODE !== 'off';
+  if (!llmPossible) {
+    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta });
+    const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
+    const j   = jitterForecast(out, key);
+    putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j);
+    return j;
+  }
 
-    // 2) лимитер вызовов
-    try {
-        await guardLLM();
-    } catch {
-        const out = heuristicForecast({
-            Hshort,
-            Hhold_eff,
-            priceUsd,
-            ch7,
-            prior_up,
-            meta
-        });
-        const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
-        const j = jitterForecast(out, key);
-        putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j);
-        return j;
-    }
+  // ── 2) Лимитер LLM-вызовов
+  try {
+    await guardLLM();
+  } catch {
+    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta });
+    const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
+    const j   = jitterForecast(out, key);
+    putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j);
+    return j;
+  }
 
-    // 3) вызов модели
-    const sys = [
-        'Ты — аналитик ценовых движений скинов CS2.',
-        `Оцени два горизонта: Hshort=${Hshort}ч и Hhold=${Hhold_eff}ч (unlock + Trade Protection).`,
-        'Даны 7д статистики (hist_7d_*) и prior_up — калибровка для Hhold.',
-        'Верни ТОЛЬКО JSON:',
-        '{ "label":"up|down|flat", "probUp_short":0..1, "probUp_hold":0..1,',
-        '  "exp_up_pct_short":-1..1, "exp_up_usd_short": number,',
-        '  "exp_up_pct_hold": -1..1, "exp_up_usd_hold":  number }'
-    ].join('\n');
+  // ── 3) Подготовка компактного ряда цен за ~7 суток (используем ГЛОБАЛЬНЫЕ хелперы)
+  const SERIES_POINTS_MAX = Number(CFG.AI_SERIES_POINTS_MAX ?? 96); // до ~96 точек
+  const SERIES_STEP_MIN   = Number(CFG.AI_SERIES_STEP_MIN   ?? 60); // шаг ~час
 
-    const userPayload = {
-        skin: skinName,
-        price_usd: priceUsd,
-        horizons: {
-            short_h: Hshort,
-            hold_h: Hhold_eff
-        },
-        prior_up,
-        hist_7d: {
-            change_pct: ch7,
-            mean: mean7,
-            std: std7,
-            samples: n7,
-            cv
-        },
-        features
+  let seriesAbs = [];
+  let seriesPct = [];
+  try {
+    const raw  = getPriceSeries(skinName, 168);                       // [{ts,price}]
+    const step = resampleByStep(raw, SERIES_STEP_MIN);                // по бинам
+    const cap  = downsamplePAA(step, SERIES_POINTS_MAX);              // ужали до M
+    seriesAbs  = cap.map(x => Number(x.price.toFixed(4)));            // компактные цены
+    seriesPct  = toPctFromFirst(cap).map(x => Number(x.pct.toFixed(5))); // % от первой точки
+  } catch (e) {
+    LOG.debug('series build failed (fallback without series)', { msg: e?.message });
+  }
+
+  // ── 4) Вызов LLM (json-ответ)
+  const sys = [
+    'Ты — аналитик ценовых движений скинов CS2.',
+    `Оцени два горизонта: Hshort=${Hshort}ч и Hhold=${Hhold_eff}ч (unlock + Trade Protection).`,
+    'Даны 7-дневные метрики (hist_7d_*) и prior_up (калибровка для Hhold).',
+    'Также дан компактный временной ряд цен (абсолюты и проценты от первой точки).',
+    'Учитывай импульсы, откаты и волатильность, но избегай переобучения на шуме.',
+    'Верни ТОЛЬКО JSON:',
+    '{ "label":"up|down|flat", "probUp_short":0..1, "probUp_hold":0..1,',
+    '  "exp_up_pct_short":-1..1, "exp_up_usd_short": number,',
+    '  "exp_up_pct_hold": -1..1, "exp_up_usd_hold":  number }'
+  ].join('\n');
+
+  const userPayload = {
+    skin: skinName,
+    price_usd: priceUsd,
+    horizons: { short_h: Hshort, hold_h: Hhold_eff },
+    prior_up,
+    hist_7d: { change_pct: ch7, mean: mean7, std: std7, samples: n7, cv },
+    series_abs: seriesAbs,
+    series_pct_from_first: seriesPct,
+    features
+  };
+
+  try {
+    const { data } = await axios.post(
+      'https://api.openai.com/v1/chat/completions',
+      {
+        model: CFG.OPENAI_MODEL,
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'user',   content: JSON.stringify(userPayload) }
+        ],
+        temperature: 0,
+        response_format: { type: 'json_object' }
+      },
+      { headers: { Authorization: `Bearer ${CFG.OPENAI_API_KEY}` }, timeout: 20000 }
+    );
+
+    const j = JSON.parse(data?.choices?.[0]?.message?.content ?? '{}');
+    const clamp01 = (x) => Math.max(0, Math.min(1, Number(x)));
+
+    const rawHold   = clamp01(j?.probUp_hold);
+    const rawShort  = clamp01(j?.probUp_short);
+
+    const probHold  = 0.65 * rawHold  + 0.35 * prior_up;
+    const probShort = 0.85 * rawShort + 0.15 * (0.5 * 0.6 + prior_up * 0.4);
+
+    const pctS = clampSym(j?.exp_up_pct_short, -0.5, 0.5);
+    const pctH = clampSym(j?.exp_up_pct_hold,  -0.5, 0.5);
+    const usdS = Number.isFinite(j?.exp_up_usd_short) ? Number(j.exp_up_usd_short) : priceUsd * pctS;
+    const usdH = Number.isFinite(j?.exp_up_usd_hold)  ? Number(j.exp_up_usd_hold)  : priceUsd * pctH;
+
+    const label = pctH >  0.003 ? 'up' : (pctH < -0.003 ? 'down' : 'flat');
+
+    const out = {
+      label,
+      probUp_short: probShort,
+      probUp_hold:  probHold,
+      probUp:       probHold,
+      exp_up_pct_short: pctS,
+      exp_up_usd_short: usdS,
+      exp_up_pct_hold:  pctH,
+      exp_up_usd_hold:  usdH,
+      horizons: meta
     };
 
-    try {
-        const {
-            data
-        } = await axios.post(
-            'https://api.openai.com/v1/chat/completions', {
-                model: CFG.OPENAI_MODEL,
-                messages: [{
-                        role: 'system',
-                        content: sys
-                    },
-                    {
-                        role: 'user',
-                        content: JSON.stringify(userPayload)
-                    }
-                ],
-                temperature: 0,
-                response_format: {
-                    type: 'json_object'
-                }
-            }, {
-                headers: {
-                    Authorization: `Bearer ${CFG.OPENAI_API_KEY}`
-                },
-                timeout: 20000
-            }
-        );
+    // Джиттер и кэш
+    const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
+    const j2  = jitterForecast(out, key);
+    putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j2);
+    return j2;
 
-        const j = JSON.parse(data?.choices?.[0]?.message?.content ?? '{}');
-        const clamp01 = (x) => Math.max(0, Math.min(1, Number(x)));
-
-        const rawHold = clamp01(j?.probUp_hold);
-        const probHold = 0.65 * rawHold + 0.35 * prior_up;
-
-        const rawShort = clamp01(j?.probUp_short);
-        const probShort = 0.85 * rawShort + 0.15 * (0.5 * 0.6 + prior_up * 0.4);
-
-        const pctS = clampSym(j?.exp_up_pct_short, -0.5, 0.5);
-        const pctH = clampSym(j?.exp_up_pct_hold, -0.5, 0.5);
-        const usdS = Number.isFinite(j?.exp_up_usd_short) ? Number(j.exp_up_usd_short) : priceUsd * pctS;
-        const usdH = Number.isFinite(j?.exp_up_usd_hold) ? Number(j.exp_up_usd_hold) : priceUsd * pctH;
-
-        const label = pctH > 0.003 ? 'up' : pctH < -0.003 ? 'down' : 'flat';
-
-        const out = {
-            label,
-            probUp_short: probShort,
-            probUp_hold: probHold,
-            probUp: probHold,
-            exp_up_pct_short: pctS,
-            exp_up_usd_short: usdS,
-            exp_up_pct_hold: pctH,
-            exp_up_usd_hold: usdH,
-            horizons: meta
-        };
-
-        // джиттер + кэш
-        const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
-        const j2 = jitterForecast(out, key);
-        putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j2);
-        return j2;
-    } catch (e) {
-        LOG.warn('forecastDirection LLM error, fallback to heuristic', {
-            status: e?.response?.status,
-            msg: e?.message
-        });
-        const out = heuristicForecast({
-            Hshort,
-            Hhold_eff,
-            priceUsd,
-            ch7,
-            prior_up,
-            meta
-        });
-        const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
-        const j2 = jitterForecast(out, key);
-        putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j2);
-        return j2;
-    }
+  } catch (e) {
+    LOG.warn('forecastDirection LLM error, fallback to heuristic', {
+      status: e?.response?.status,
+      msg: e?.message
+    });
+    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta });
+    const key = `${skinName}|${priceUsd}|${features?.unlock_hours||0}`;
+    const j2  = jitterForecast(out, key);
+    putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j2);
+    return j2;
+  }
 }
 
 
