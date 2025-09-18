@@ -1043,6 +1043,31 @@ if (botReady) {
     notify(`💰 Продажа (ручная) за ${price.toFixed(2)} $ (комиссия ${(price * CFG.FEE_RATE).toFixed(2)})\nБаланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`);
   });
 
+    // /hist <точное имя> [hours=168]
+  bot.command('hist', async (ctx) => {
+    try {
+      const raw = (ctx.match || '').trim();
+      if (!raw) return ctx.reply('Использование: /hist <точное имя> [hours=168]');
+      let name = raw, hours = 168;
+      const m = raw.match(/\bhours=(\d+)\b/i);
+      if (m) { hours = Math.max(1, Math.min(168*4, parseInt(m[1],10))); name = raw.replace(/\s*\bhours=\d+\b\s*/i,'').trim(); }
+      const s = getPriceChange7d(name, hours);
+      await waitForFresh(name);
+      const min = getLiveMinOffer(name);
+      const now = min ? Number(min.price) : s.price_now;
+      const lines = [
+        `⏱ Период: ~${hours} ч`,
+        `Текущая: $${(now??0).toFixed(2)}`,
+        `Изменение: ${(s.change_pct*100).toFixed(2)}% ($${(s.change_usd||0).toFixed(2)})`,
+        `Средняя: $${(s.mean_price||0).toFixed(2)} • Стд: $${(s.std_price||0).toFixed(2)}`,
+        `Точек наблюдений: ${s.sample_cnt||0}`
+      ].join('\n');
+      ctx.reply(`📈 ${name}\n` + lines);
+    } catch (e) {
+      ctx.reply('hist ошибка: ' + (e.message || e));
+    }
+  });
+
   // управление циклами и сокетами
   bot.command('ws_on', (ctx) => { startWs(); ctx.reply('WebSocket: ВКЛ'); });
   bot.command('ws_off', (ctx) => { stopWs(); ctx.reply('WebSocket: ВЫКЛ'); });
