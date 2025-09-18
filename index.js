@@ -77,6 +77,35 @@ const IS_LIVE = CFG.MODE === 'LIVE';
 // ──────────────────────────────────────────────────────────────────────────────
 // 1) Логи
 // ──────────────────────────────────────────────────────────────────────────────
+// ── DEBUG
+let DEBUG_SCAN = false;
+
+// Сколько последних WS событий хранить
+const DEBUG_WS_BUF_CAP = Number(process.env.DEBUG_WS_BUF_CAP || 500);
+
+// Кольцевой буфер сырых WS публикаций
+const wsBuf = [];
+let wsSeq = 0;
+function pushWsDebug(kind, payload) {
+  try {
+    const rec = {
+      seq: ++wsSeq,
+      t: new Date().toISOString(),
+      kind,                  // тип канала/ивента
+      id: payload?.id ?? null,
+      name: payload?.name ?? null,
+      price: (payload?.price!=null ? Number(payload.price) : null),
+      unlock_at: payload?.unlock_at ?? null,
+      created_at: payload?.created_at ?? null,
+      event: payload?.event ?? null,
+      raw: payload            // полный payload (останется в JSON)
+    };
+    wsBuf.push(rec);
+    if (wsBuf.length > DEBUG_WS_BUF_CAP) wsBuf.shift();
+  } catch {}
+}
+
+
 function jlog(level, msg, data = {}) {
     const rec = {
         t: new Date().toISOString(),
@@ -481,7 +510,6 @@ function prettifyEvent(ev) {
 }
 
 function subscribePublic() {
-  // попытаемся включить recovery (если сервер Centrifugo настроен с history)
   const sub = centrifuge.newSubscription('public:obtained-skins', { recover: true });
 
   sub.on('publication', (ctx) => {
@@ -493,61 +521,63 @@ function subscribePublic() {
       case 'obtained_skin_price_changed':
         upsertOfferFromEvent({ id, name, price, unlock_at, created_at });
         break;
-
       case 'obtained_skin_deleted':
         removeOfferFromEvent({ id, name });
         break;
-
       default:
-        // на всякий случай апсертим, если пришёл price
         if (name && Number.isFinite(Number(price))) {
           upsertOfferFromEvent({ id, name, price, unlock_at, created_at });
         }
     }
+
+    // ← вот здесь, внутри handler-а:
+    pushWsDebug('public:obtained-skins', d);
   });
 
   sub.on('subscribing', (c) => LOG.debug(`WS subscribing public: ${c.code} ${c.reason||''}`));
-  sub.on('subscribed', (ctx) => {
-    LOG.info(`WS subscribed: public:obtained-skins (recovered=${!!ctx?.recovered})`);
-  });
+  sub.on('subscribed', (ctx) => LOG.info(`WS subscribed: public:obtained-skins (recovered=${!!ctx?.recovered})`));
   sub.on('unsubscribed', (c) => LOG.warn(`WS unsubscribed public: ${c.code} ${c.reason||''}`));
   sub.subscribe();
   wsSubs.push(sub);
+
+  // УДАЛИТЬ: pushWsDebug('public:obtained-skins', d);
 }
 
-
 function subscribePrivate(userId) {
-    if (!userId) return;
-    const chan = `private:purchase-skins#${userId}`;
-    const sub = centrifuge.newSubscription(chan);
+  if (!userId) return;
+  const chan = `private:purchase-skins#${userId}`;
+  const sub = centrifuge.newSubscription(chan);
 
-    sub.on('publication', (ctx) => {
-        const p = ctx?.data || ctx;
-        const {
-            id,
-            name,
-            price,
-            status,
-            return_reason,
-            error,
-            steam_trade_offer_id,
-            event
-        } = p || {};
-        const msg = [
-            `${prettifyEvent(event)}: ${name||'(—)'} — ${(Number(price)||0).toFixed(2)} $`,
-            `Статус: ${status||'—'}`,
-            steam_trade_offer_id ? `TradeOffer: ${steam_trade_offer_id}` : null,
-            error ? `Ошибка: ${error}` : null,
-            return_reason ? `Причина возврата: ${return_reason}` : null
-        ].filter(Boolean).join('\n');
-        notifyOnce(msg, `purchase:${id}:${status}`, 15 * 60e3);
-    });
+  sub.on('publication', (ctx) => {
+    const p = ctx?.data || ctx;
+    const { id, name, price, status, return_reason, error, steam_trade_offer_id, event } = p || {};
 
-    sub.on('subscribing', (c) => LOG.debug(`WS subscribing ${chan}: ${c.code} ${c.reason||''}`));
-    sub.on('subscribed', () => LOG.info(`WS subscribed: ${chan}`));
-    sub.on('unsubscribed', (c) => LOG.warn(`WS unsubscribed ${chan}: ${c.code} ${c.reason||''}`));
-    sub.subscribe();
-    wsSubs.push(sub);
+    const msg = [
+      `${prettifyEvent(event)}: ${name||'(—)'} — ${(Number(price)||0).toFixed(2)} $`,
+      `Статус: ${status||'—'}`,
+      steam_trade_offer_id ? `TradeOffer: ${steam_trade_offer_id}` : null,
+      error ? `Ошибка: ${error}` : null,
+      return_reason ? `Причина возврата: ${return_reason}` : null
+    ].filter(Boolean).join('\n');
+    notifyOnce(msg, `purchase:${id}:${status}`, 15 * 60e3);
+
+    // ← лог сюда:
+    pushWsDebug(chan, p);
+  });
+
+  sub.on('subscribing', (c) => LOG.debug(`WS subscribing ${chan}: ${c.code} ${c.reason||''}`));
+  sub.on('subscribed', () => LOG.info(`WS subscribed: ${chan}`));
+  sub.on('unsubscribed', (c) => LOG.warn(`WS unsubscribed ${chan}: ${c.code} ${c.reason||''}`));
+  sub.subscribe();
+  wsSubs.push(sub);
+
+  // УДАЛИТЬ: pushWsDebug(`private:purchase-skins#${userId}`, p);
+}
+
+function gcOffers() {
+  const cutoff = Date.now() - CFG.WS_INDEX_GC_MIN * 60e3;
+  db.prepare(`DELETE FROM live_offers WHERE active=0 AND updated_at IS NOT NULL AND strftime('%s', updated_at) <= ?`)
+    .run(Math.floor(cutoff/1000));
 }
 
 async function startWs() {
@@ -569,9 +599,10 @@ async function startWs() {
     subscribePublic();
     if (CFG.LIS_USER_ID) subscribePrivate(CFG.LIS_USER_ID);
     // периодический GC
-    setInterval(gcLiveIndex, 5 * 60e3).unref();
+    setInterval(gcOffers, 5 * 60e3).unref();
     LOG.info('WS started');
 }
+
 
 function stopWs() {
     try {
@@ -911,28 +942,28 @@ async function forecastDirection({
     }
 }
 
-// ранжирование ИЗ liveIndex (никакого REST)
 async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
+  if (DEBUG_SCAN) LOG.debug('aiRankFromLive: args', { price_from, price_to, only_unlocked, limit });
   resetLLM();
   const now = Date.now();
 
-  // один активный минимальный лот на каждое имя
+  // один активный минимальный лот на каждое имя (тай-брейк по skin_id)
   const rows = db.prepare(`
-        SELECT lo.*
-    FROM live_offers lo
-    JOIN (
-    SELECT skin_name, MIN(price) AS minp, MIN(skin_id) AS min_id
-    FROM live_offers
-    WHERE active=1
-    GROUP BY skin_name
-    ) m ON lo.skin_name = m.skin_name
-        AND lo.price = m.minp
-        AND lo.skin_id = m.min_id
-    WHERE lo.active = 1
+    SELECT skin_id, skin_name, price, unlock_at, created_at, updated_at, active
+    FROM (
+      SELECT lo.*,
+             ROW_NUMBER() OVER (PARTITION BY skin_name ORDER BY price ASC, skin_id ASC) AS rn
+      FROM live_offers lo
+      WHERE active=1
+    )
+    WHERE rn=1
   `).all();
+  if (DEBUG_SCAN) LOG.debug('aiRankFromLive: rows', { count: rows.length });
 
   // фильтры
-  let arr = rows;
+  let arr = rows
+    .filter(r => Number.isFinite(Number(r.price))); // защита от мусора по цене
+
   if (Number.isFinite(price_from)) arr = arr.filter(r => Number(r.price) >= price_from);
   if (Number.isFinite(price_to))   arr = arr.filter(r => Number(r.price) <= price_to);
   if (only_unlocked) {
@@ -942,13 +973,16 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
       return !Number.isFinite(t) || t <= now;
     });
   }
+  if (DEBUG_SCAN) LOG.debug('aiRankFromLive: filtered', { count: arr.length });
 
-  // ограничим сырьё
-  arr = arr.slice(0, CFG.AI_SCAN_LIMIT);
-
-  // предскоринг/LLM как у вас сейчас (ниже — тот же код, только поля переименованы)
+  // прескор на всём множестве, затем обрезаем до AI_SCAN_LIMIT
   const pre = arr.map(r => {
-    const fts = skinFeaturesFromLive({ skin_name: r.skin_name, price: r.price, unlock_at: r.unlock_at, created_at: r.created_at });
+    const fts = skinFeaturesFromLive({
+      skin_name: r.skin_name,
+      price: r.price,
+      unlock_at: r.unlock_at,
+      created_at: r.created_at
+    });
     const holdHours = (fts?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
     const unlockH   = Math.max(0, Math.round((fts?.unlock_hours || 0) + holdHours));
     const ch7       = Number(fts?.hist_7d_change_pct || 0);
@@ -958,20 +992,32 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
     return { r, fts, score };
   });
 
-  pre.sort((a,b)=> b.score - a.score);
-  const K = (CFG.AI_LLM_MODE === 'llm') ? pre.length :
-            (CFG.AI_LLM_MODE === 'auto') ? CFG.AI_OPENAI_MAX_CALLS_PER_SCAN : 0;
-  const mark = new Set(pre.slice(0, K).map(x => x.r.skin_name));
+  pre.sort((a, b) => b.score - a.score);
+  const preCapped = pre.slice(0, CFG.AI_SCAN_LIMIT);
 
+  if (DEBUG_SCAN) LOG.debug('aiRankFromLive: pre-scores(top)', {
+    sample: preCapped.slice(0, 5).map(x => ({ name: x.r.skin_name, price: x.r.price, score: x.score }))
+  });
+
+  // какие имена пойдём в LLM (если AUTO/LLM включён)
+  const K = (CFG.AI_LLM_MODE === 'llm') ? preCapped.length
+          : (CFG.AI_LLM_MODE === 'auto') ? CFG.AI_OPENAI_MAX_CALLS_PER_SCAN
+          : 0;
+  const mark = new Set(preCapped.slice(0, K).map(x => x.r.skin_name));
+
+  // прогнозирование
   const scored = [];
-  for (const row of pre) {
+  for (const row of preCapped) {
     const r   = row.r;
     const fts = row.fts;
     const allowLLM = mark.has(r.skin_name) && CFG.AI_LLM_MODE !== 'off';
+
     let f = await forecastDirection({ skinName: r.skin_name, features: fts, allowLLM });
     f.horizons = { ...(f.horizons||{}), price_usd: Number(fts.price_usd || 0) };
+
     const key = `${r.skin_id}|${r.price}|${r.created_at||''}|${r.unlock_at||''}`;
     f = jitterForecast(f, key);
+
     const grossHoldPct = Number(f?.exp_up_pct_hold || 0);
     const netHoldPct   = grossHoldPct - 2 * CFG.FEE_RATE;
 
@@ -989,7 +1035,7 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
     });
   }
 
-  scored.sort((a,b)=>{
+  scored.sort((a, b) => {
     if (b.netHoldPct !== a.netHoldPct) return b.netHoldPct - a.netHoldPct;
     const ap = Number(a?.it?.price), bp = Number(b?.it?.price);
     if (Number.isFinite(ap) && Number.isFinite(bp)) return ap - bp;
@@ -999,6 +1045,13 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
   const n        = Number.isFinite(Number(limit)) ? Number(limit) : 10;
   const anyAbove = scored.some(x => x.netHoldPct >= CFG.MIN_EDGE_HOLD_PCT);
   const pool     = anyAbove ? scored.filter(x => x.netHoldPct >= CFG.MIN_EDGE_HOLD_PCT) : scored;
+
+  if (DEBUG_SCAN) LOG.debug('aiRankFromLive: scored_top', {
+    top: scored.slice(0, 5).map(s => ({
+      name: s.it.name, price: s.it.price, prob: s.f.probUp_hold, netHoldPct: s.netHoldPct
+    }))
+  });
+
   return pool.slice(0, n);
 }
 
@@ -1029,9 +1082,10 @@ function trackSkinForSignals(name, entry, unlockHours = 0) {
 }
 
 
+// Минимальная цена по имени (тай-брейк по skin_id)
 function getCurrentMinPriceByName(name) {
   const row = db.prepare(`
-    SELECT lo.price
+    SELECT lo.price, lo.skin_id
     FROM live_offers lo
     JOIN (
       SELECT skin_name, MIN(price) AS minp, MIN(skin_id) AS min_id
@@ -1042,8 +1096,26 @@ function getCurrentMinPriceByName(name) {
     WHERE lo.active=1
     LIMIT 1
   `).get(name);
-  return row ? Number(row.price) : NaN;
+  return row ? { price: Number(row.price), id: Number(row.skin_id) } : null;
 }
+
+// Все активные лоты по имени, самые дешёвые N
+function getCheapestOffersByName(name, limit=10) {
+  return db.prepare(`
+    SELECT skin_id, price, unlock_at, created_at, updated_at
+    FROM live_offers
+    WHERE active=1 AND skin_name=?
+    ORDER BY price ASC, skin_id ASC
+    LIMIT ?
+  `).all(name, limit).map(r=>({
+    id: Number(r.skin_id),
+    price: Number(r.price),
+    unlock_at: r.unlock_at || null,
+    created_at: r.created_at || null,
+    updated_at: r.updated_at || null
+  }));
+}
+
 
 
 async function refreshSignals() {
@@ -1051,7 +1123,10 @@ async function refreshSignals() {
   const now = Date.now();
 
   for (const [name, rec] of watchMap) {
-    const p = getCurrentMinPriceByName(name);
+    const mp = getCurrentMinPriceByName(name);
+    if (!mp) continue;
+
+    const p = Number(mp.price);
     if (!Number.isFinite(p)) continue;
 
     rec.last = p;
@@ -1068,6 +1143,7 @@ async function refreshSignals() {
     }
   }
 }
+
 
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1318,6 +1394,100 @@ function stopSignalLoop() {
 
 // Команды
 if (bot) {
+
+    // Вкл/выкл подробного скан-дебага
+bot.command('ai_debug_on', (ctx)=>{
+  DEBUG_SCAN = true;
+  ctx.reply('AI debug: ВКЛ');
+});
+bot.command('ai_debug_off', (ctx)=>{
+  DEBUG_SCAN = false;
+  ctx.reply('AI debug: ВЫКЛ');
+});
+
+// Показать последние WS события
+// /ws_recent [n=50] [filter=подстрока_в_имени]
+bot.command('ws_recent', async (ctx)=>{
+  try {
+    const raw = (ctx.match||'').trim();
+    let n = 50, filter = '';
+    if (raw) {
+      for (const tok of raw.split(/\s+/)) {
+        const m1 = /^n=(\d+)$/.exec(tok); if (m1) { n = Math.max(1, Math.min(500, Number(m1[1]))); continue; }
+        const m2 = /^filter=(.+)$/.exec(tok); if (m2) { filter = m2[1]; continue; }
+      }
+    }
+    const items = wsBuf
+      .filter(r => !filter || String(r.name||'').toLowerCase().includes(filter.toLowerCase()))
+      .slice(-n);
+    if (!items.length) return ctx.reply('WS событий нет (под ваш фильтр).');
+    const lines = items.map(r =>
+      `${r.seq}. ${r.t} ${r.kind} ${r.event||''}\n   ${r.name||'(—)'} #${r.id||'—'}  ${r.price!=null ? r.price.toFixed(2)+' $' : '—'}`
+    );
+    await sendLongHtml(ctx, `<b>Последние WS события</b>\n\n<pre>${escHtml(lines.join('\n'))}</pre>`);
+  } catch(e) {
+    ctx.reply(`ws_recent ошибка: ${e.message||e}`);
+  }
+});
+
+// Сырой dump последних WS событий (JSON), осторожно: длинно
+// /ws_dump [n=50]
+bot.command('ws_dump', async (ctx)=>{
+  const n = Math.max(1, Math.min(200, Number((ctx.match||'').trim()||50)));
+  const items = wsBuf.slice(-n);
+  const json = JSON.stringify(items, null, 2);
+  await sendLongHtml(ctx, `<b>WS raw dump (${items.length})</b>\n\n<pre>${escHtml(json)}</pre>`);
+});
+
+// Минимальная цена и дешёвые лоты по имени
+// /min_price <имя точное> [n=10]
+bot.command('min_price', async (ctx)=>{
+  const raw = (ctx.match||'').trim();
+  if (!raw) return ctx.reply('Использование: /min_price <точное имя> [n=10]');
+  const parts = raw.split(/\s+/);
+  const name = parts[0];
+  const n = Math.max(1, Math.min(50, Number(parts[1]||10)));
+  const min = getCurrentMinPriceByName(name);
+  const cheapest = getCheapestOffersByName(name, n);
+  const header = min ? `Минимум: $${min.price.toFixed(2)} (id ${min.id})` : 'Минимум: не найден';
+  const list = cheapest.map((o,i)=> `${i+1}. $${o.price.toFixed(2)} • id ${o.id} • unlock_at: ${o.unlock_at||'—'}`).join('\n') || 'нет активных лотов';
+  await sendLongHtml(ctx, `🔎 <b>${escHtml(name)}</b>\n\n${escHtml(header)}\n\n<pre>${escHtml(list)}</pre>`);
+});
+
+// Отладочная версия ai_scan — показывает и красивый вывод, и сырой JSON
+bot.command('ai_scan_dbg', async (ctx)=>{
+  try {
+    // те же аргументы, что и /ai_scan
+    const raw = (ctx.match ?? '').trim();
+    const kv = {};
+    if (raw) for (const token of raw.split(/\s+/)) {
+      const m = /^([^=\s]+)=(.+)$/.exec(token); if (m) kv[m[1]] = m[2];
+    }
+    const price_from   = kv.price_from   !== undefined ? Number(kv.price_from)   : CFG.AI_MIN_PRICE_USD;
+    const price_to     = kv.price_to     !== undefined ? Number(kv.price_to)     : CFG.AI_MAX_PRICE_USD;
+    const only_unlocked= kv.only_unlocked!== undefined ? Number(kv.only_unlocked): Number(process.env.AI_ONLY_UNLOCKED_DEFAULT || 0);
+    const limit        = kv.limit        !== undefined ? Number(kv.limit)        : 10;
+
+    // флаг дебага
+    const old = DEBUG_SCAN; DEBUG_SCAN = true;
+    const ranked = await aiRankFromLive({ price_from, price_to, only_unlocked, limit });
+    DEBUG_SCAN = old;
+
+    const pretty = formatScanMessage(ranked);
+    const plain = ranked.map(x => ({
+      id: x.it.id, name: x.it.name, price: x.it.price,
+      probUp_short: x.f.probUp_short, probUp_hold: x.f.probUp_hold,
+      exp_up_pct_short: x.f.exp_up_pct_short, exp_up_pct_hold: x.f.exp_up_pct_hold,
+      netHoldPct: x.netHoldPct, netHoldUSD: x.netHoldUSD,
+      horizons: x.f.horizons
+    }));
+    await sendLongHtml(ctx, pretty + `\n\n<b>DEBUG JSON:</b>\n<pre>${escHtml(JSON.stringify(plain, null, 2))}</pre>`);
+  } catch(e) {
+    await ctx.reply('ai_scan_dbg ошибка: ' + (e.response?.status || '') + ' ' + (e.message || ''));
+  }
+});
+
+
     bot.catch(e => LOG.error('Telegram error', {
         msg: e.message
     }));
