@@ -56,11 +56,17 @@ const CFG = {
 
   // WebSocket / история
   WS_SNAPSHOT_MIN_INTERVAL_SEC: Number(process.env.WS_SNAPSHOT_MIN_INTERVAL_SEC || 20),
-  WS_INDEX_GC_MIN: Number(process.env.WS_INDEX_GC_MIN || 180),
 
-  // «Самая свежая цена» — как долго ждём/считаем актуальной
+  // «Самая свежая цена»
   FRESH_WAIT_MS: Number(process.env.FRESH_WAIT_MS || 200),
   FRESH_STALENESS_MS: Number(process.env.FRESH_STALENESS_MS || 1000),
+
+  // Источники каталога CS2
+  CATALOG_MODE: (process.env.CATALOG_MODE || 'full').toLowerCase(), // full | unlocked | lock_days
+  CATALOG_LOCK_DAYS: Number(process.env.CATALOG_LOCK_DAYS || 1),
+  CATALOG_URL_FULL: 'https://lis-skins.com/market_export_json/api_csgo_full.json',
+  CATALOG_URL_UNLOCKED: 'https://lis-skins.com/market_export_json/api_csgo_unlocked.json',
+  CATALOG_URL_LOCK_TPL: 'https://lis-skins.com/market_export_json/api_csgo_lock_{days}_days.json',
 };
 
 const IS_LIVE = CFG.MODE === 'LIVE';
@@ -84,7 +90,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const clampSym = (x, a = -0.5, b = 0.5) => Math.max(a, Math.min(b, Number(x) || 0));
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 2) БД (журнал истории/бумажный учёт)
+/** 2) БД: история/кэш прогнозов/бумажный учёт */
 // ──────────────────────────────────────────────────────────────────────────────
 fs.mkdirSync(path.dirname(CFG.DB_FILE), { recursive: true });
 const db = new Database(CFG.DB_FILE);
@@ -119,7 +125,6 @@ CREATE TABLE IF NOT EXISTS forecasts_cache (
  ts        TEXT NOT NULL
 );
 `);
-
 (function initBalance() {
   if (IS_LIVE) return;
   const row = db.prepare('SELECT USD FROM balance WHERE id=1').get();
@@ -129,7 +134,7 @@ const getPaperBalance = () => db.prepare('SELECT USD FROM balance WHERE id=1').g
 const setPaperBalance = (v) => db.prepare('UPDATE balance SET USD=? WHERE id=1').run(v);
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 3) LIS API (только нужное)
+/** 3) HTTP API для баланса/покупки/токена WS */
 // ──────────────────────────────────────────────────────────────────────────────
 function authHeaders() {
   const h = { Accept: 'application/json' };
@@ -175,20 +180,26 @@ const lis = {
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 4) Live индекс (только память) + история в БД
+/** 4) Каталог CS2 из JSON-экспортов + live индекс */
 // ──────────────────────────────────────────────────────────────────────────────
 let centrifuge = null, wsSubs = [], wsConnected = false;
 const DEBUG_WS_BUF_CAP = Number(process.env.DEBUG_WS_BUF_CAP || 500);
 const wsBuf = [];
 let wsSeq = 0;
 
-const offersById = new Map();     // id -> {id,name,price,unlock_at,created_at,updated_at,active}
+// live офферы и минимумы (только память)
+const offersById = new Map();     // id -> {id,name,price,unlock_at,created_at,updated_at,active,+catalog:*}
 const minByName  = new Map();     // name -> {id, price}
-const lastByNameTs = new Map();   // name -> ms timestamp последнего изменения минимума
-let lastTickAt = 0;               // любой тик
+const lastByNameTs = new Map();   // name -> ts последнего обновления минимума
 
-const snapGuard = new Map();      // антифлуд в историю: name->lastTs
+// каталог с расширенными полями
+const catalogById = new Map();    // id -> full item from export
+const catalogByName = new Map();  // name -> массив id (может быть несколько)
 
+// история снапшотов (антифлуд)
+const snapGuard = new Map();
+
+// ——— отладка WS
 function pushWsDebug(kind, payload) {
   try {
     const rec = {
@@ -222,12 +233,24 @@ function canSnapshot(name) {
   return false;
 }
 
-function upsertOfferFromEvent({ id, name, price, unlock_at, created_at }) {
+function enrichWithCatalog(rec) {
+  const cat = catalogById.get(rec.id);
+  return cat ? { ...rec, catalog: cat } : rec;
+}
+
+function setMin(name, id, price) {
+  const now = Date.now();
+  const cur = minByName.get(name);
+  if (!cur || price < cur.price || (cur.id === id && price !== cur.price)) {
+    minByName.set(name, { id, price });
+    lastByNameTs.set(name, now);
+  }
+}
+
+function upsertOffer({ id, name, price, unlock_at, created_at }) {
   if (!id || !name || !Number.isFinite(Number(price))) return;
   const nowIso = new Date().toISOString();
-  const now = Date.now();
 
-  // память
   const rec = {
     id: Number(id),
     name: String(name),
@@ -237,46 +260,90 @@ function upsertOfferFromEvent({ id, name, price, unlock_at, created_at }) {
     updated_at: nowIso,
     active: 1
   };
-  offersById.set(rec.id, rec);
+  offersById.set(rec.id, enrichWithCatalog(rec));
+  setMin(rec.name, rec.id, rec.price);
 
-  // минимум по имени
-  const cur = minByName.get(rec.name);
-  if (!cur || rec.price < cur.price || (cur && rec.id === cur.id && rec.price !== cur.price)) {
-    minByName.set(rec.name, { id: rec.id, price: rec.price });
-    lastByNameTs.set(rec.name, now);
-  }
-
-  lastTickAt = now;
-
-  // история (для 7д)
+  // история (7д)
   if (canSnapshot(rec.name)) {
     db.prepare(`INSERT OR REPLACE INTO price_snapshots (skin_name, skin_id, price, ts) VALUES (?,?,?,?)`)
       .run(rec.name, rec.id, rec.price, nowIso);
   }
 }
 
-function removeOfferFromEvent({ id, name }) {
+function removeOffer({ id, name }) {
   if (!id) return;
   const row = offersById.get(Number(id));
   offersById.delete(Number(id));
   const nm = name || row?.name;
-  if (nm) {
-    const cur = minByName.get(nm);
-    if (cur && cur.id === Number(id)) {
-      // пересчёт минимума по имени
-      let best = null;
-      for (const v of offersById.values()) {
-        if (v.name !== nm) continue;
-        if (!best || v.price < best.price) best = { id: v.id, price: v.price };
-      }
-      if (best) minByName.set(nm, best);
-      else minByName.delete(nm);
-      lastByNameTs.set(nm, Date.now());
+  if (!nm) return;
+
+  const cur = minByName.get(nm);
+  if (cur && cur.id === Number(id)) {
+    let best = null;
+    for (const v of offersById.values()) {
+      if (v.name !== nm) continue;
+      if (!best || v.price < best.price) best = { id: v.id, price: v.price };
     }
+    if (best) minByName.set(nm, best);
+    else minByName.delete(nm);
+    lastByNameTs.set(nm, Date.now());
   }
-  lastTickAt = Date.now();
 }
 
+// ——— загрузка каталога CS2
+function getCatalogUrl() {
+  switch (CFG.CATALOG_MODE) {
+    case 'unlocked': return CFG.CATALOG_URL_UNLOCKED;
+    case 'lock_days': return CFG.CATALOG_URL_LOCK_TPL.replace('{days}', String(Math.max(1, Math.min(8, CFG.CATALOG_LOCK_DAYS))));
+    case 'full':
+    default: return CFG.CATALOG_URL_FULL;
+  }
+}
+
+async function loadCsgoCatalog() {
+  const url = getCatalogUrl();
+  LOG.info('Загружаю каталог CS2', { url });
+  const { data } = await axios.get(url, { timeout: 30000 });
+  if (!data || !Array.isArray(data.items)) {
+    throw new Error('bad catalog format');
+  }
+
+  // очистим
+  catalogById.clear();
+  catalogByName.clear();
+
+  // наполним каталог и стартовые офферы/минимумы
+  let added = 0;
+  for (const it of data.items) {
+    const id = Number(it.id);
+    const name = String(it.name || '');
+    if (!id || !name) continue;
+
+    // сохраняем полный item
+    catalogById.set(id, it);
+    const ids = catalogByName.get(name) || [];
+    ids.push(id);
+    catalogByName.set(name, ids);
+
+    // стартовая цена из каталога (до прихода WS)
+    if (Number.isFinite(Number(it.price))) {
+      upsertOffer({
+        id,
+        name,
+        price: Number(it.price),
+        unlock_at: it.unlock_at || null,
+        created_at: it.created_at || null
+      });
+      added++;
+    }
+  }
+  LOG.info('Каталог CS2 загружен', { items: data.items.length, offers_seeded: added });
+  return { total: data.items.length, seeded: added, last_update: data.last_update || null };
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+/** 5) WebSocket */
+// ──────────────────────────────────────────────────────────────────────────────
 function subscribePublic() {
   const sub = centrifuge.newSubscription('public:obtained-skins', { recover: true });
   sub.on('publication', (ctx) => {
@@ -285,13 +352,13 @@ function subscribePublic() {
     switch (event) {
       case 'obtained_skin_added':
       case 'obtained_skin_price_changed':
-        upsertOfferFromEvent({ id, name, price, unlock_at, created_at });
+        upsertOffer({ id, name, price, unlock_at, created_at });
         break;
       case 'obtained_skin_deleted':
-        removeOfferFromEvent({ id, name });
+        removeOffer({ id, name });
         break;
       default:
-        if (name && Number.isFinite(Number(price))) upsertOfferFromEvent({ id, name, price, unlock_at, created_at });
+        if (name && Number.isFinite(Number(price))) upsertOffer({ id, name, price, unlock_at, created_at });
     }
     pushWsDebug('public:obtained-skins', d);
   });
@@ -333,36 +400,29 @@ function stopWs() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 5) «Самая свежая цена» — helpers
+/** 6) «Самая свежая цена»: ожидание и чтение */
 // ──────────────────────────────────────────────────────────────────────────────
-function nowMs(){ return Date.now(); }
-
 async function waitForFresh(name, { maxWaitMs = CFG.FRESH_WAIT_MS, maxStalenessMs = CFG.FRESH_STALENESS_MS } = {}) {
-  const start = nowMs();
+  const start = Date.now();
   const has = () => {
     const min = minByName.get(name);
     if (!min) return false;
     const t = lastByNameTs.get(name) || 0;
-    return (nowMs() - t) <= maxStalenessMs;
+    return (Date.now() - t) <= maxStalenessMs;
   };
-  // если актуально — сразу
   if (has()) return;
-  // иначе короткое дожидание (десятки мс, пока летит тик)
-  while (nowMs() - start < maxWaitMs) {
+  while (Date.now() - start < maxWaitMs) {
     await sleep(10);
     if (has()) return;
   }
 }
-
 function getLiveMinOffer(name) {
   const m = minByName.get(name);
   if (!m) return null;
   const off = offersById.get(m.id);
   return off ? { ...off } : null;
 }
-
 function* iterateLiveMins() {
-  // Для пула ранжирования: по одному минимальному лоту на имя
   for (const [name, ref] of minByName) {
     const off = offersById.get(ref.id);
     if (off) yield { ...off };
@@ -370,7 +430,7 @@ function* iterateLiveMins() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 6) История и признаки
+/** 7) История / признаки / прогноз */
 // ──────────────────────────────────────────────────────────────────────────────
 function getPriceSeries(name, hours = 168) {
   const sinceIso = new Date(Date.now() - hours * 3600e3).toISOString();
@@ -425,9 +485,7 @@ function getPriceChange7d(name, hours = 168) {
   return { sample_cnt: rows.length, price_then, price_now, change_usd, change_pct, mean_price: mean, std_price: std };
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 7) Прогноз
-// ──────────────────────────────────────────────────────────────────────────────
+// Прогноз (LLM+эвристика)
 let _llmCallsThisScan = 0, _lastLLMCallAt = 0;
 const resetLLM = () => { _llmCallsThisScan = 0; };
 async function guardLLM() {
@@ -560,7 +618,8 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
     'Даны 7-дневные метрики и prior_up.',
     'Верни ТОЛЬКО JSON: { "label":"up|down|flat", "probUp_short":0..1, "probUp_hold":0..1, "exp_up_pct_short":-1..1, "exp_up_usd_short":n, "exp_up_pct_hold":-1..1, "exp_up_usd_hold":n }'
   ].join('\n');
- const payload = {
+
+  const payload = {
     skin: skinName,
     price_usd: priceUsd,
     horizons: { short_h: Hshort, hold_h: Hhold_eff },
@@ -587,7 +646,8 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
     const pctS  = clampSym(j?.exp_up_pct_short), pctH = clampSym(j?.exp_up_pct_hold);
     const usdS  = Number.isFinite(j?.exp_up_usd_short) ? Number(j.exp_up_usd_short) : priceUsd * pctS;
     const usdH  = Number.isFinite(j?.exp_up_usd_hold)  ? Number(j.exp_up_usd_hold)  : priceUsd * pctH;
-const out = { label: pctH>0.003?'up':(pctH<-0.003?'down':'flat'),
+
+    const out = { label: pctH>0.003?'up':(pctH<-0.003?'down':'flat'),
       probUp_short: probS, probUp_hold: probH, probUp: probH,
       exp_up_pct_short: pctS, exp_up_pct_hold: pctH,
       exp_up_usd_short: usdS, exp_up_usd_hold: usdH, horizons: meta };
@@ -604,13 +664,12 @@ const out = { label: pctH>0.003?'up':(pctH<-0.003?'down':'flat'),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 8) Ранжирование — ТОЛЬКО live WebSocket индекс
+/** 8) Ранжирование по live-минимумам */
 // ──────────────────────────────────────────────────────────────────────────────
 async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
   resetLLM();
   const now = Date.now();
 
-  // Собираем пул минимальных офферов по имени из памяти
   const pool = [];
   for (const off of iterateLiveMins()) {
     const p = Number(off.price);
@@ -623,7 +682,7 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
     }
     pool.push(off);
   }
-// Предскोर
+
   const pre = pool.map(off => {
     const fts = skinFeaturesFromLive(off);
     const holdHours = (fts?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
@@ -637,19 +696,15 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
 
   const preCapped = pre.slice(0, CFG.AI_SCAN_LIMIT);
 
-  // Какие имена пойдут в LLM
   const K = (CFG.AI_LLM_MODE === 'llm') ? preCapped.length
         : (CFG.AI_LLM_MODE === 'auto') ? CFG.AI_OPENAI_MAX_CALLS_PER_SCAN : 0;
   const mark = new Set(preCapped.slice(0, K).map(x => x.off.name));
 
-  // Прогноз
   const scored = [];
   for (const row of preCapped) {
-    // гарантируем свежесть перед расчётом
     await waitForFresh(row.off.name);
-
     const liveNow = getLiveMinOffer(row.off.name);
-    const off = liveNow || row.off; // если ничего не прилетело за FRESH_WAIT — используем текущий
+    const off = liveNow || row.off;
     const fts = skinFeaturesFromLive(off);
     const allowLLM = mark.has(off.name) && CFG.AI_LLM_MODE !== 'off';
 
@@ -658,7 +713,8 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
 
     const grossHoldPct = Number(f?.exp_up_pct_hold || 0);
     const netHoldPct   = grossHoldPct - 2 * CFG.FEE_RATE;
-scored.push({
+
+    scored.push({
       it: { id: off.id, name: off.name, price: Number(off.price), unlock_at: off.unlock_at, created_at: off.created_at },
       f, netHoldPct, netHoldUSD: Number(off.price || 0) * netHoldPct
     });
@@ -678,7 +734,7 @@ scored.push({
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/* 9) TP/SL и учёт баланса */
+/** 9) TP/SL и баланс */
 // ──────────────────────────────────────────────────────────────────────────────
 const watchMap = new Map(); // name -> {entry,tp,sl,last, not_before}
 function trackSkinForSignals(name, entry, unlockHours = 0) {
@@ -707,7 +763,7 @@ const paperSpend  = (amt)=> { if (!amt) return; setPaperBalance(getPaperBalance(
 const paperIncome = (amt)=> { if (!amt) return; setPaperBalance(getPaperBalance() + amt*(1-CFG.FEE_RATE)); };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 10) Telegram
+/** 10) Telegram */
 // ──────────────────────────────────────────────────────────────────────────────
 const bot = CFG.TG_BOT_TOKEN ? new Bot(CFG.TG_BOT_TOKEN) : null;
 function notify(text) {
@@ -731,7 +787,6 @@ function fmtUsdSigned(x,d=2){ const v=Number(x); if(!Number.isFinite(v)) return 
 function fmtUsd(x,d=2){ const v=Number(x); return Number.isFinite(v)? '$'+v.toFixed(d) : '—'; }
 function escHtml(s=''){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// безопасная нарезка, ВСЕГДА закрывает <pre>
 async function sendLongHtml(ctx, html) {
   const TG_LIMIT = 4096, LIMIT = TG_LIMIT - 128;
   const chunks = []; const blocks = String(html).split(/\n{2,}/); let buf = '';
@@ -785,6 +840,233 @@ function formatScanMessage(ranked) {
   return `🔎 <b>Топ кандидаты</b>\n\n` + rows.join('\n\n');
 }
 
+// Команды
+const botReady = !!bot;
+if (botReady) {
+  bot.catch(e => LOG.error('Telegram error', { msg: e.message }));
+
+  bot.command('start', async (ctx)=>{
+    const bal = await visibleBalance();
+    ctx.reply(`Режим: ${CFG.MODE} | Баланс: ${Number.isNaN(bal)?'—':bal.toFixed(2)+' $'}`);
+  });
+  bot.command('balance', async (ctx)=>{
+     const bal = await visibleBalance();
+    ctx.reply(`Текущий баланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`);
+  });
+
+  // последние WS события
+  bot.command('ws_recent', async (ctx) => {
+    try {
+      const raw = (ctx.match || '').trim();
+      let n = 50, filter = '';
+      if (raw) {
+        for (const tok of raw.split(/\s+/)) {
+          const m1 = /^n=(\d+)$/.exec(tok); if (m1) { n = Math.max(1, Math.min(500, Number(m1[1]))); continue; }
+          const m2 = /^filter=(.+)$/.exec(tok); if (m2) { filter = m2[1]; continue; }
+        }
+      }
+      const items = wsBuf
+        .filter(r => !filter || String(r.name || '').toLowerCase().includes(filter.toLowerCase()))
+        .slice(-n);
+      if (!items.length) return ctx.reply('WS событий нет (под ваш фильтр).');
+      const lines = items.map(r =>
+        `${r.seq}. ${r.t} ${r.kind} ${r.event || ''}\n   ${r.name || '(—)'} #${r.id || '—'}  ${r.price != null ? r.price.toFixed(2) + ' $' : '—'}`
+      );
+      await sendLongHtml(ctx, `<b>Последние WS события</b>\n\n<pre>${escHtml(lines.join('\n'))}</pre>`);
+    } catch (e) {
+      ctx.reply(`ws_recent ошибка: ${e.message || e}`);
+    }
+  });
+
+    // минимальная текущая (самая свежая) цена
+  // /min_price <точное имя> [n=10]
+  bot.command('min_price', async (ctx) => {
+    try {
+      const raw = (ctx.match || '').trim();
+      if (!raw) return ctx.reply('Использование: /min_price <точное имя> [n=10]');
+      let name = raw, n = 10;
+
+      const mKV = raw.match(/\bn=(\d+)\b/i);
+      if (mKV) {
+        n = Math.max(1, Math.min(50, parseInt(mKV[1], 10)));
+        name = raw.replace(/\s*\bn=\d+\b\s*/i, '').trim();
+      } else {
+        const tokens = raw.split(/\s+/);
+        const last = tokens[tokens.length - 1];
+        if (/^\d+$/.test(last)) {
+          n = Math.max(1, Math.min(50, parseInt(last, 10)));
+          name = tokens.slice(0, -1).join(' ');
+        }
+      }
+      if (!name) return ctx.reply('Укажите имя предмета.');
+
+      await waitForFresh(name);
+      const min = getLiveMinOffer(name);
+      const header = min ? `Минимум (свежий): $${Number(min.price).toFixed(2)} (id ${min.id})` : 'Минимум: не найден';
+
+      // соберём n самых дешёвых из памяти прямо сейчас
+      const cheapest = [];
+      for (const off of offersById.values()) if (off.name === name) cheapest.push(off);
+      cheapest.sort((a, b) => a.price === b.price ? a.id - b.id : a.price - b.price);
+
+      const list = cheapest.slice(0, n).map((o, i) =>
+        `${i + 1}. $${Number(o.price).toFixed(2)} • id ${o.id} • unlock_at: ${o.unlock_at || '—'}`
+      );
+
+      await sendLongHtml(ctx,
+        `🔎 <b>${escHtml(name)}</b>\n\n${escHtml(header)}\n\n<pre>${escHtml(list.join('\n') || 'нет активных лотов')}</pre>`
+      );
+    } catch (e) {
+      ctx.reply(`min_price ошибка: ${e.message || e}`);
+    }
+  });
+
+   // отладочный ai_scan (с JSON)
+  bot.command('ai_scan_dbg', async (ctx) => {
+    try {
+      const kv = {}; const raw = (ctx.match ?? '').trim();
+      if (raw) for (const t of raw.split(/\s+/)) { const m = /^([^=\s]+)=(.+)$/.exec(t); if (m) kv[m[1]] = m[2]; }
+
+      const ranked = await aiRankFromLive({
+        price_from: kv.price_from !== undefined ? Number(kv.price_from) : CFG.AI_MIN_PRICE_USD,
+        price_to: kv.price_to !== undefined ? Number(kv.price_to) : CFG.AI_MAX_PRICE_USD,
+        only_unlocked: Number(kv.only_unlocked || 0),
+        limit: kv.limit !== undefined ? Number(kv.limit) : 10
+      });
+
+      const pretty = formatScanMessage(ranked);
+      const plain = ranked.map(x => ({
+        id: x.it.id, name: x.it.name, price: x.it.price,
+        probUp_short: x.f.probUp_short, probUp_hold: x.f.probUp_hold,
+        exp_up_pct_short: x.f.exp_up_pct_short, exp_up_pct_hold: x.f.exp_up_pct_hold,
+        netHoldPct: x.netHoldPct, netHoldUSD: x.netHoldUSD, horizons: x.f.horizons
+      }));
+      await sendLongHtml(ctx, pretty + `\n\n<b>DEBUG JSON:</b>\n<pre>${escHtml(JSON.stringify(plain, null, 2))}</pre>`);
+    } catch (e) {
+      await ctx.reply('ai_scan_dbg ошибка: ' + (e.response?.status || '') + ' ' + (e.message || ''));
+    }
+  });
+
+  // обычный ai_scan
+  bot.command('ai_scan', async (ctx) => {
+    try {
+      const kv = {}; const raw = (ctx.match ?? '').trim();
+      if (raw) for (const t of raw.split(/\s+/)) { const m = /^([^=\s]+)=(.+)$/.exec(t); if (m) kv[m[1]] = m[2]; }
+      const ranked = await aiRankFromLive({
+        price_from: kv.price_from !== undefined ? Number(kv.price_from) : CFG.AI_MIN_PRICE_USD,
+        price_to: kv.price_to !== undefined ? Number(kv.price_to) : CFG.AI_MAX_PRICE_USD,
+        only_unlocked: Number(kv.only_unlocked || 0),
+        limit: kv.limit !== undefined ? Number(kv.limit) : 10
+      });
+      const text = formatScanMessage(ranked);
+      await sendLongHtml(ctx, text);
+    } catch (e) {
+      await ctx.reply('ai_scan ошибка: ' + (e.response?.status || '') + ' ' + (e.message || ''));
+    }
+  });
+
+  // покупка напрямую
+  bot.command('buy_user', async (ctx) => {
+    const p = (ctx.match || '').trim().split(/\s+/);
+    if (p.length < 3) return ctx.reply('Использование: /buy_user <ids> <partner> <token> [max_price]');
+    const ids = p[0].split(',').map(Number).filter(Boolean);
+    const partner = p[1], token = p[2], max_price = p[3] ? Number(p[3]) : undefined;
+    if (!ids.length) return ctx.reply('Список ids пуст');
+    const custom_id = `tg-${Date.now()}-${ids.join('-')}`;
+    try {
+      const res = await lis.buyForUser({ ids, partner, token, max_price, skip_unavailable: true, custom_id });
+      const payload = res?.data || res;
+      const skins = Array.isArray(payload?.skins) ? payload.skins : [];
+      const spent = skins.reduce((s, x) => s + Number(x.price || 0), 0);
+      if (!skins.length || spent <= 0) {
+        notifyOnce(`ℹ️ Покупка: ничего не куплено (ids: ${ids.join(',')})`, `tg_buy_empty:${custom_id}`, 30 * 60e3);
+        return ctx.reply('Ничего не куплено.');
+      }
+      if (!IS_LIVE) paperSpend(spent);
+      const bal = await visibleBalance();
+      const fee = spent * CFG.FEE_RATE;
+      db.prepare('INSERT INTO trades (side, skin_id, skin_name, qty, price, fee, ts, mode) VALUES (?,?,?,?,?,?,?,?)')
+        .run('BUY', ids.join(','), skins[0]?.name || '', skins.length || 1, spent, fee, new Date().toISOString(), CFG.MODE);
+      const lines = skins.map(s => `• ${s.id} ${s.name || ''} за ${s.price ?? '?'} $ [${s.status}]`).join('\n');
+      const msg = [
+        `✅ Покупка успешна | ID: ${payload?.purchase_id || 'N/A'}`,
+        `Потрачено: ${spent.toFixed(2)} $ (комиссия ${fee.toFixed(2)})`,
+        `Баланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`,
+        lines
+      ].join('\n');
+      notifyOnce(msg, `tg_buy:${payload?.purchase_id || custom_id}`, 3600e3);
+      ctx.reply('Готово. Проверь уведомление.');
+      const avgEntry = spent / skins.length;
+      if (Number.isFinite(avgEntry) && avgEntry > 0) trackSkinForSignals(skins[0].name, avgEntry, 0);
+    } catch (e) {
+      notify(`❌ Ошибка покупки: ${(e.response?.status || '')} ${(e.message || '')}`);
+      ctx.reply('Ошибка покупки.');
+    }
+  });
+
+  // учёт ручной продажи (PAPER)
+  bot.command('sold', async (ctx) => {
+    const p = (ctx.match || '').trim().split(/\s+/);
+    if (!p[0]) return ctx.reply('Использование: /sold <цена> [название]');
+    const price = Number(p[0]); const name = p.slice(1).join(' ');
+    if (!Number.isFinite(price)) return ctx.reply('Некорректная цена');
+    if (!IS_LIVE) paperIncome(price);
+    db.prepare('INSERT INTO trades (side, skin_id, skin_name, qty, price, fee, ts, mode) VALUES (?,?,?,?,?,?,?,?)')
+      .run('SELL', null, name || '', 1, price, price * CFG.FEE_RATE, new Date().toISOString(), CFG.MODE);
+    const bal = await visibleBalance();
+    notify(`💰 Продажа (ручная) за ${price.toFixed(2)} $ (комиссия ${(price * CFG.FEE_RATE).toFixed(2)})\nБаланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`);
+  });
+
+  // управление циклами и сокетами
+  bot.command('ws_on', (ctx) => { startWs(); ctx.reply('WebSocket: ВКЛ'); });
+  bot.command('ws_off', (ctx) => { stopWs(); ctx.reply('WebSocket: ВЫКЛ'); });
+
+  bot.command('ai_on', (ctx) => { startAiLoop(); ctx.reply(`Автопокупка: ВКЛ (порог ${(CFG.AI_MIN_PROB_UP * 100).toFixed(0)}%, диапазон $${CFG.AI_MIN_PRICE_USD}..$${CFG.AI_MAX_PRICE_USD})`); });
+  bot.command('ai_off', (ctx) => { stopAiLoop(); ctx.reply('Автопокупка: ВЫКЛ'); });
+  bot.command('ai_once', async (ctx) => { await aiScanAndMaybeBuy(); ctx.reply('Один проход AI-сканера выполнен'); });
+
+  bot.command('sig_on', (ctx) => { startSignalLoop(); ctx.reply('Сигналы TP/SL: ВКЛ'); });
+  bot.command('sig_off', (ctx) => { stopSignalLoop(); ctx.reply('Сигналы TP/SL: ВЫКЛ'); });
+
+  // перезагрузка каталога
+  bot.command('catalog_reload', async (ctx) => {
+    try {
+      const info = await loadCsgoCatalog();
+      ctx.reply(`Каталог перезагружен: items=${info.total}, seeded=${info.seeded}`);
+    } catch (e) {
+      ctx.reply(`catalog_reload ошибка: ${e.message || e}`);
+    }
+  });
+
+  bot.start().then(() => LOG.info('Telegram-бот запущен'));
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 11) AI-цикл, сигналы и покупка
+// ──────────────────────────────────────────────────────────────────────────────
+let aiTimer = null, signalTimer = null;
+
+function startAiLoop() {
+  if (aiTimer) return;
+  aiTimer = setInterval(aiScanAndMaybeBuy, Number(process.env.AI_SCAN_EVERY_MS || 20000));
+  LOG.info('AI loop ON');
+}
+function stopAiLoop() {
+  if (!aiTimer) return;
+  clearInterval(aiTimer); aiTimer = null;
+  LOG.info('AI loop OFF');
+}
+function startSignalLoop() {
+  if (signalTimer) return;
+  signalTimer = setInterval(refreshSignals, Number(process.env.SIGNAL_EVERY_MS || 30000));
+  LOG.info('Signals loop ON');
+}
+function stopSignalLoop() {
+  if (!signalTimer) return;
+  clearInterval(signalTimer); signalTimer = null;
+  LOG.info('Signals loop OFF');
+}
+
 async function aiScanAndMaybeBuy() {
   const ranked = await aiRankFromLive({
     price_from: CFG.AI_MIN_PRICE_USD,
@@ -804,220 +1086,93 @@ async function aiScanAndMaybeBuy() {
     const it = { ...live };
 
     const cid = `ai-${Date.now()}-${it.id}`;
-    let payload, skins=[], spent=0;
+    let payload, skins = [], spent = 0;
     try {
-      const res = await lis.buyForUser({ ids:[it.id], partner:CFG.BUY_PARTNER, token:CFG.BUY_TOKEN, max_price: it.price, skip_unavailable:true, custom_id: cid });
+      const res = await lis.buyForUser({
+        ids: [it.id],
+        partner: CFG.BUY_PARTNER,
+        token: CFG.BUY_TOKEN,
+        max_price: it.price,
+        skip_unavailable: true,
+        custom_id: cid
+      });
       payload = res?.data || res;
       skins = Array.isArray(payload?.skins) ? payload.skins : [];
-      spent = skins.reduce((s,k)=> s + Number(k.price||0), 0);
-    } catch(e) {
-      LOG.error('buy fail', { msg:e.message, data:e.response?.data }); continue;
+      spent = skins.reduce((s, k) => s + Number(k.price || 0), 0);
+    } catch (e) {
+      LOG.error('buy fail', { msg: e.message, data: e.response?.data });
+      continue;
     }
-    if (!skins.length || spent<=0) { notifyOnce(`🤖 AI-попытка: ${it.name}\nРезультат: ничего не куплено`, `buy_empty:${cid}`, 30*60e3); continue; }
+
+    if (!skins.length || spent <= 0) {
+      notifyOnce(`🤖 AI-попытка: ${it.name}\nРезультат: ничего не куплено`, `buy_empty:${cid}`, 30 * 60e3);
+      continue;
+    }
 
     if (!IS_LIVE) paperSpend(spent);
     const bal = await visibleBalance();
-    const lines = skins.map(s=>`• ${s.id} ${s.name||it.name} за ${s.price??'?'} $ [${s.status}]`).join('\n');
+    const lines = skins.map(s => `• ${s.id} ${s.name || it.name} за ${s.price ?? '?'} $ [${s.status}]`).join('\n');
     const text = [
       '🤖 AI-покупка',
-      `Причина: P↑=${(x.f.probUp*100).toFixed(2)}% ≥ ${(CFG.AI_MIN_PROB_UP*100).toFixed(0)}%`,
-      `ID покупки: ${payload?.purchase_id||'N/A'}`,
-      `Потрачено: ${spent.toFixed(2)} $ (комиссия ${(spent*CFG.FEE_RATE).toFixed(2)})`,
-      `Баланс: ${Number.isNaN(bal)?'—':bal.toFixed(2)+' $'}`,
-      `Прогноз: Δ3ч≈${fmtPctSigned(x.f.exp_up_pct_short)} (${fmtUsdSigned(x.f.exp_up_usd_short||0)}), Δк продаже≈${fmtPctSigned(x.f.exp_up_pct_hold)} (${fmtUsdSigned(x.f.exp_up_usd_hold||0)})`,
+      `Причина: P↑=${(x.f.probUp * 100).toFixed(2)}% ≥ ${(CFG.AI_MIN_PROB_UP * 100).toFixed(0)}%`,
+      `ID покупки: ${payload?.purchase_id || 'N/A'}`,
+      `Потрачено: ${spent.toFixed(2)} $ (комиссия ${(spent * CFG.FEE_RATE).toFixed(2)})`,
+      `Баланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`,
+      `Прогноз: Δ3ч≈${fmtPctSigned(x.f.exp_up_pct_short)} (${fmtUsdSigned(x.f.exp_up_usd_short || 0)}), Δк продаже≈${fmtPctSigned(x.f.exp_up_pct_hold)} (${fmtUsdSigned(x.f.exp_up_usd_hold || 0)})`,
       lines
     ].join('\n');
-    notifyOnce(text, `buy:${payload?.purchase_id||it.id}`, 3600e3);
+    notifyOnce(text, `buy:${payload?.purchase_id || it.id}`, 3600e3);
 
     const entry = spent / skins.length;
-    if (Number.isFinite(entry) && entry>0) {
+    if (Number.isFinite(entry) && entry > 0) {
       const now = Date.now(), ts = Date.parse(it.unlock_at || '');
-      const unlockH = (Number.isFinite(ts) && ts > now) ? Math.ceil((ts - now)/3600e3) : 0;
+      const unlockH = (Number.isFinite(ts) && ts > now) ? Math.ceil((ts - now) / 3600e3) : 0;
       trackSkinForSignals(skins[0]?.name || it.name, entry, unlockH);
     }
     break; // одна покупка за проход
   }
 }
 
-// Команды
-if (bot) {
-  bot.catch(e => LOG.error('Telegram error', { msg: e.message }));
-
-  bot.command('start', async (ctx)=>{
-    const bal = await visibleBalance();
-    ctx.reply(`Режим: ${CFG.MODE} | Баланс: ${Number.isNaN(bal)?'—':bal.toFixed(2)+' $'}`);
-  });
-  bot.command('balance', async (ctx)=>{
-    const bal = await visibleBalance();
-    ctx.reply(`Текущий баланс: ${Number.isNaN(bal)?'—':bal.toFixed(2)+' $'}`);
-  });
-
-  // последние WS
-  bot.command('ws_recent', async (ctx)=>{
-    try {
-      const raw = (ctx.match||'').trim();
-      let n=50, filter='';
-      if (raw) for (const tok of raw.split(/\s+/)) {
-        const m1=/^n=(\d+)$/.exec(tok); if (m1) { n=Math.max(1,Math.min(500,Number(m1[1]))); continue; }
-        const m2=/^filter=(.+)$/.exec(tok); if (m2) { filter=m2[1]; continue; }
-      }
-      const items = wsBuf.filter(r => !filter || String(r.name||'').toLowerCase().includes(filter.toLowerCase())).slice(-n);
-      if (!items.length) return ctx.reply('WS событий нет (под ваш фильтр).');
-      const lines = items.map(r=> `${r.seq}. ${r.t} ${r.kind} ${r.event||''}\n   ${r.name||'(—)'} #${r.id||'—'}  ${r.price!=null ? r.price.toFixed(2)+' $' : '—'}`);
-      await sendLongHtml(ctx, `<b>Последние WS события</b>\n\n<pre>${escHtml(lines.join('\n'))}</pre>`);
-    } catch(e){ ctx.reply(`ws_recent ошибка: ${e.message||e}`); }
-  });
-
-   // минимальная текущая (САМАЯ СВЕЖАЯ) цена
-  bot.command('min_price', async (ctx)=>{
-    try {
-      const raw = (ctx.match || '').trim();
-      if (!raw) return ctx.reply('Использование: /min_price <точное имя> [n=10]');
-      let name = raw, n = 10;
-      const mKV = raw.match(/\bn=(\d+)\b/i);
-      if (mKV) { n = Math.max(1, Math.min(50, parseInt(mKV[1],10))); name = raw.replace(/\s*\bn=\d+\b\s*/i, '').trim(); }
-      else {
-        const tokens = raw.split(/\s+/); const last = tokens[tokens.length-1];
-        if (/^\d+$/.test(last)) { n=Math.max(1,Math.min(50,parseInt(last,10))); name=tokens.slice(0,-1).join(' '); }
-      }
-      if (!name) return ctx.reply('Укажите имя предмета.');
-
-      await waitForFresh(name);
-      const min = getLiveMinOffer(name);
-      const header = min ? `Минимум (свежий): $${Number(min.price).toFixed(2)} (id ${min.id})` : 'Минимум: не найден';
-
-      // соберём n самых дешёвых ИЗ ПАМЯТИ прямо сейчас
-      const cheapest = [];
-      for (const off of offersById.values()) if (off.name === name) cheapest.push(off);
-      cheapest.sort((a,b)=> a.price===b.price ? a.id-b.id : a.price-b.price);
-      const list = cheapest.slice(0, n).map((o,i)=> `${i+1}. $${Number(o.price).toFixed(2)} • id ${o.id} • unlock_at: ${o.unlock_at||'—'}`);
-
-      await sendLongHtml(ctx, `🔎 <b>${escHtml(name)}</b>\n\n${escHtml(header)}\n\n<pre>${escHtml(list.join('\n') || 'нет активных лотов')}</pre>`);
-    } catch(e) { ctx.reply(`min_price ошибка: ${e.message||e}`); }
-  });
-
-    // отладочный ai_scan (с JSON)
-  bot.command('ai_scan_dbg', async (ctx)=>{
-    try {
-      const kv={}; const raw=(ctx.match??'').trim();
-      if (raw) for (const t of raw.split(/\s+/)){ const m=/^([^=\s]+)=(.+)$/.exec(t); if(m) kv[m[1]]=m[2]; }
-      const ranked = await aiRankFromLive({
-        price_from:  kv.price_from   !== undefined ? Number(kv.price_from)   : CFG.AI_MIN_PRICE_USD,
-        price_to:    kv.price_to     !== undefined ? Number(kv.price_to)     : CFG.AI_MAX_PRICE_USD,
-        only_unlocked: Number(kv.only_unlocked||0),
-        limit:       kv.limit        !== undefined ? Number(kv.limit)        : 10
-      });
-      const pretty = formatScanMessage(ranked);
-      const plain = ranked.map(x=>({
-        id:x.it.id, name:x.it.name, price:x.it.price,
-        probUp_short:x.f.probUp_short, probUp_hold:x.f.probUp_hold,
-        exp_up_pct_short:x.f.exp_up_pct_short, exp_up_pct_hold:x.f.exp_up_pct_hold,
-        netHoldPct:x.netHoldPct, netHoldUSD:x.netHoldUSD, horizons:x.f.horizons
-      }));
-      await sendLongHtml(ctx, pretty + `\n\n<b>DEBUG JSON:</b>\n<pre>${escHtml(JSON.stringify(plain,null,2))}</pre>`);
-    } catch(e){ await ctx.reply('ai_scan_dbg ошибка: ' + (e.response?.status||'') + ' ' + (e.message||'')); }
-  });
-
-    // обычный ai_scan
-  bot.command('ai_scan', async (ctx)=>{
-    try{
-      const kv={}; const raw=(ctx.match??'').trim();
-      if (raw) for (const t of raw.split(/\s+/)){ const m=/^([^=\s]+)=(.+)$/.exec(t); if(m) kv[m[1]]=m[2]; }
-      const ranked = await aiRankFromLive({
-        price_from:  kv.price_from   !== undefined ? Number(kv.price_from)   : CFG.AI_MIN_PRICE_USD,
-        price_to:    kv.price_to     !== undefined ? Number(kv.price_to)     : CFG.AI_MAX_PRICE_USD,
-        only_unlocked: Number(kv.only_unlocked||0),
-        limit:       kv.limit        !== undefined ? Number(kv.limit)        : 10
-      });
-      const text = formatScanMessage(ranked);
-      await sendLongHtml(ctx, text);
-    } catch(e){
-      await ctx.reply('ai_scan ошибка: ' + (e.response?.status||'') + ' ' + (e.message||''));
-    }
-  });
-
-    // прямой buy
-  bot.command('buy_user', async (ctx)=>{
-    const p=(ctx.match||'').trim().split(/\s+/);
-    if (p.length<3) return ctx.reply('Использование: /buy_user <ids> <partner> <token> [max_price]');
-    const ids = p[0].split(',').map(Number).filter(Boolean);
-    const partner = p[1], token = p[2], max_price = p[3] ? Number(p[3]) : undefined;
-    if (!ids.length) return ctx.reply('Список ids пуст');
-    const custom_id = `tg-${Date.now()}-${ids.join('-')}`;
-    try {
-      const res = await lis.buyForUser({ ids, partner, token, max_price, skip_unavailable:true, custom_id });
-      const payload = res?.data || res;
-      const skins = Array.isArray(payload?.skins) ? payload.skins : [];
-      const spent = skins.reduce((s,x)=> s+Number(x.price||0),0);
-      if (!skins.length || spent<=0) { notifyOnce(`ℹ️ Покупка: ничего не куплено (ids: ${ids.join(',')})`,`tg_buy_empty:${custom_id}`,30*60e3); return ctx.reply('Ничего не куплено.'); }
-      if (!IS_LIVE) paperSpend(spent);
-      const bal = await visibleBalance();
-      const fee = spent * CFG.FEE_RATE;
-      db.prepare('INSERT INTO trades (side, skin_id, skin_name, qty, price, fee, ts, mode) VALUES (?,?,?,?,?,?,?,?)')
-        .run('BUY', ids.join(','), skins[0]?.name || '', skins.length || 1, spent, fee, new Date().toISOString(), CFG.MODE);
-      const lines = skins.map(s=>`• ${s.id} ${s.name||''} за ${s.price??'?'} $ [${s.status}]`).join('\n');
-      const msg = [`✅ Покупка успешна | ID: ${payload?.purchase_id||'N/A'}`, `Потрачено: ${spent.toFixed(2)} $ (комиссия ${fee.toFixed(2)})`, `Баланс: ${Number.isNaN(bal)?'—':bal.toFixed(2)+' $'}`, lines].join('\n');
-      notifyOnce(msg, `tg_buy:${payload?.purchase_id||custom_id}`, 3600e3);
-      ctx.reply('Готово. Проверь уведомление.');
-      const avgEntry = spent / skins.length; if (Number.isFinite(avgEntry) && avgEntry>0) trackSkinForSignals(skins[0].name, avgEntry, 0);
-    } catch(e) { notify(`❌ Ошибка покупки: ${(e.response?.status||'')} ${(e.message||'')}`); ctx.reply('Ошибка покупки.'); }
-  });
-
-    // учёт ручной продажи (PAPER)
-  bot.command('sold', async (ctx)=>{
-    const p=(ctx.match||'').trim().split(/\s+/);
-    if (!p[0]) return ctx.reply('Использование: /sold <цена> [название]');
-    const price = Number(p[0]); const name = p.slice(1).join(' ');
-    if (!Number.isFinite(price)) return ctx.reply('Некорректная цена');
-    if (!IS_LIVE) paperIncome(price);
-    db.prepare('INSERT INTO trades (side, skin_id, skin_name, qty, price, fee, ts, mode) VALUES (?,?,?,?,?,?,?,?)')
-      .run('SELL', null, name || '', 1, price, price*CFG.FEE_RATE, new Date().toISOString(), CFG.MODE);
-    const bal = await visibleBalance();
-    notify(`💰 Продажа (ручная) за ${price.toFixed(2)} $ (комиссия ${(price*CFG.FEE_RATE).toFixed(2)})\nБаланс: ${Number.isNaN(bal)?'—':bal.toFixed(2)+' $'}`);
-  });
-
-    // циклы
-  bot.command('ws_on', (ctx)=>{ startWs(); ctx.reply('WebSocket: ВКЛ'); });
-  bot.command('ws_off', (ctx)=>{ stopWs();  ctx.reply('WebSocket: ВЫКЛ'); });
-
-  bot.command('ai_on',  (ctx)=>{ startAiLoop(); ctx.reply(`Автопокупка: ВКЛ (порог ${(CFG.AI_MIN_PROB_UP*100).toFixed(0)}%, диапазон $${CFG.AI_MIN_PRICE_USD}..$${CFG.AI_MAX_PRICE_USD})`); });
-  bot.command('ai_off', (ctx)=>{ stopAiLoop();  ctx.reply('Автопокупка: ВЫКЛ'); });
-  bot.command('ai_once', async (ctx)=>{ await aiScanAndMaybeBuy(); ctx.reply('Один проход AI-сканера выполнен'); });
-
-  bot.command('sig_on',  (ctx)=>{ startSignalLoop(); ctx.reply('Сигналы TP/SL: ВКЛ'); });
-  bot.command('sig_off', (ctx)=>{ stopSignalLoop();  ctx.reply('Сигналы TP/SL: ВЫКЛ'); });
-
-  bot.start().then(()=> LOG.info('Telegram-бот запущен'));
+// ──────────────────────────────────────────────────────────────────────────────
+// 12) MAIN / shutdown
+// ──────────────────────────────────────────────────────────────────────────────
+function mainLoops() {
+  startWs();
+  startSignalLoop();
+  if (Number(CFG.AI_AUTO_BUY) === 1) startAiLoop();
 }
 
-let aiTimer=null, signalTimer=null;
-function startAiLoop(){ if(aiTimer) return; aiTimer=setInterval(aiScanAndMaybeBuy, Number(process.env.AI_SCAN_EVERY_MS||20000)); LOG.info('AI loop ON'); }
-function stopAiLoop(){ if(!aiTimer) return; clearInterval(aiTimer); aiTimer=null; LOG.info('AI loop OFF'); }
-function startSignalLoop(){ if(signalTimer) return; signalTimer=setInterval(refreshSignals, Number(process.env.SIGNAL_EVERY_MS||30000)); LOG.info('Signals loop ON'); }
-function stopSignalLoop(){ if(!signalTimer) return; clearInterval(signalTimer); signalTimer=null; LOG.info('Signals loop OFF'); }
+async function main() {
+  LOG.info('Бот запускается', { catalog_mode: CFG.CATALOG_MODE });
+  try {
+    await loadCsgoCatalog();
+  } catch (e) {
+    LOG.warn('Каталог не загружен', { msg: e.message });
+  }
+  mainLoops();
+}
 
-// ──────────────────────────────────────────────────────────────────────────────
-// 11) MAIN / shutdown
-// ──────────────────────────────────────────────────────────────────────────────
-function mainLoops(){ startWs(); startSignalLoop(); if (Number(CFG.AI_AUTO_BUY)===1) startAiLoop(); }
-async function main(){ LOG.info('Бот запускается', {}); mainLoops(); }
-function shutdown(code=0){
-  try{ stopAiLoop(); }catch{}
-  try{ stopSignalLoop(); }catch{}
-  try{ stopWs(); }catch{}
-  try{ if(bot) bot.stop(); }catch{}
-  try{ db.close(); }catch{}
+function shutdown(code = 0) {
+  try { stopAiLoop(); } catch {}
+  try { stopSignalLoop(); } catch {}
+  try { stopWs(); } catch {}
+  try { if (bot) bot.stop(); } catch {}
+  try { db.close(); } catch {}
   LOG.info('Бот остановлен');
   process.exit(code);
 }
+
 if (require.main === module) {
-  main().catch(e => { LOG.error('Фатальная ошибка старта', { msg:e.message, data:e?.response?.data }); shutdown(1); });
-  process.on('SIGINT', ()=>shutdown(0));
-  process.on('SIGTERM',()=>shutdown(0));
+  main().catch(e => {
+    LOG.error('Фатальная ошибка старта', { msg: e.message, data: e?.response?.data });
+    shutdown(1);
+  });
+  process.on('SIGINT', () => shutdown(0));
+  process.on('SIGTERM', () => shutdown(0));
 }
 
 module.exports = {
   CFG, IS_LIVE, db, lis,
   aiRankFromLive, aiScanAndMaybeBuy, trackSkinForSignals,
-  startWs, stopWs
+  startWs, stopWs, loadCsgoCatalog
 };
