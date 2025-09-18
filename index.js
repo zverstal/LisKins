@@ -247,8 +247,18 @@ function setMin(name, id, price) {
   }
 }
 
+function isCs2Id(id) {
+  return catalogById.has(Number(id));
+}
+function isCs2Name(name) {
+  return catalogByName.has(String(name || ''));
+}
+
 function upsertOffer({ id, name, price, unlock_at, created_at }) {
   if (!id || !name || !Number.isFinite(Number(price))) return;
+
+  // 🔒 фильтр по каталогу CS2
+  if (!isCs2Id(id)) return;
   const nowIso = new Date().toISOString();
 
   const rec = {
@@ -272,6 +282,7 @@ function upsertOffer({ id, name, price, unlock_at, created_at }) {
 
 function removeOffer({ id, name }) {
   if (!id) return;
+  if (!isCs2Id(id)) return; // не наш домен — игнорим
   const row = offersById.get(Number(id));
   offersById.delete(Number(id));
   const nm = name || row?.name;
@@ -338,6 +349,19 @@ async function loadCsgoCatalog() {
     }
   }
   LOG.info('Каталог CS2 загружен', { items: data.items.length, offers_seeded: added });
+   // 🧹 выкинуть всё, что не из нового каталога
+  for (const [id, off] of [...offersById]) {
+    if (!catalogById.has(id)) {
+      offersById.delete(id);
+    }
+  }
+  for (const [name, ref] of [...minByName]) {
+    if (!catalogById.has(ref.id)) {
+      minByName.delete(name);
+      lastByNameTs.delete(name);
+    }
+  }
+
   return { total: data.items.length, seeded: added, last_update: data.last_update || null };
 }
 
@@ -420,12 +444,13 @@ function getLiveMinOffer(name) {
   const m = minByName.get(name);
   if (!m) return null;
   const off = offersById.get(m.id);
-  return off ? { ...off } : null;
+  if (!off || !isCs2Id(off.id)) return null;
+  return { ...off };
 }
 function* iterateLiveMins() {
   for (const [name, ref] of minByName) {
     const off = offersById.get(ref.id);
-    if (off) yield { ...off };
+    if (off && isCs2Id(off.id)) yield { ...off };
   }
 }
 
@@ -881,28 +906,38 @@ if (botReady) {
   });
 
   // последние WS события
-  bot.command('ws_recent', async (ctx) => {
-    try {
-      const raw = (ctx.match || '').trim();
-      let n = 50, filter = '';
-      if (raw) {
-        for (const tok of raw.split(/\s+/)) {
-          const m1 = /^n=(\d+)$/.exec(tok); if (m1) { n = Math.max(1, Math.min(500, Number(m1[1]))); continue; }
-          const m2 = /^filter=(.+)$/.exec(tok); if (m2) { filter = m2[1]; continue; }
-        }
+bot.command('ws_recent', async (ctx) => {
+  try {
+    const raw = (ctx.match || '').trim();
+    let n = 50, filter = '', cs2Only = false;
+
+    if (raw) {
+      for (const tok of raw.split(/\s+/)) {
+        const m1 = /^n=(\d+)$/.exec(tok);       if (m1) { n = Math.max(1, Math.min(500, Number(m1[1]))); continue; }
+        const m2 = /^filter=(.+)$/.exec(tok);    if (m2) { filter = m2[1]; continue; }
+        const m3 = /^cs2=(\d+)$/.exec(tok);      if (m3) { cs2Only = Number(m3[1]) === 1; continue; }
       }
-      const items = wsBuf
-        .filter(r => !filter || String(r.name || '').toLowerCase().includes(filter.toLowerCase()))
-        .slice(-n);
-      if (!items.length) return ctx.reply('WS событий нет (под ваш фильтр).');
-      const lines = items.map(r =>
-        `${r.seq}. ${r.t} ${r.kind} ${r.event || ''}\n   ${r.name || '(—)'} #${r.id || '—'}  ${r.price != null ? r.price.toFixed(2) + ' $' : '—'}`
-      );
-      await sendLongHtml(ctx, `<b>Последние WS события</b>\n\n<pre>${escHtml(lines.join('\n'))}</pre>`);
-    } catch (e) {
-      ctx.reply(`ws_recent ошибка: ${e.message || e}`);
     }
-  });
+
+    let items = wsBuf
+      .filter(r => !filter || String(r.name || '').toLowerCase().includes(filter.toLowerCase()));
+
+    // Показываем только события, где id присутствует в нашем CS2-каталоге
+    if (cs2Only) items = items.filter(r => isCs2Id(r.id));
+
+    items = items.slice(-n);
+    if (!items.length) return ctx.reply('WS событий нет (под ваш фильтр).');
+
+    const lines = items.map(r =>
+      `${r.seq}. ${r.t} ${r.kind} ${r.event || ''}\n   ${r.name || '(—)'} #${r.id || '—'}  ${r.price != null ? Number(r.price).toFixed(2) + ' $' : '—'}`
+    );
+
+    await sendLongHtml(ctx, `<b>Последние WS события</b>\n\n<pre>${escHtml(lines.join('\n'))}</pre>`);
+  } catch (e) {
+    ctx.reply(`ws_recent ошибка: ${e.message || e}`);
+  }
+});
+
 
     // минимальная текущая (самая свежая) цена
   // /min_price <точное имя> [n=10]
@@ -932,7 +967,7 @@ if (botReady) {
 
       // соберём n самых дешёвых из памяти прямо сейчас
       const cheapest = [];
-      for (const off of offersById.values()) if (off.name === name) cheapest.push(off);
+      for (const off of offersById.values()) if (off.name === name && isCs2Id(off.id)) cheapest.push(off);
       cheapest.sort((a, b) => a.price === b.price ? a.id - b.id : a.price - b.price);
 
       const list = cheapest.slice(0, n).map((o, i) =>
@@ -995,9 +1030,9 @@ if (botReady) {
   bot.command('buy_user', async (ctx) => {
     const p = (ctx.match || '').trim().split(/\s+/);
     if (p.length < 3) return ctx.reply('Использование: /buy_user <ids> <partner> <token> [max_price]');
-    const ids = p[0].split(',').map(Number).filter(Boolean);
+    const ids = p[0].split(',').map(Number).filter(id => isCs2Id(id));
     const partner = p[1], token = p[2], max_price = p[3] ? Number(p[3]) : undefined;
-    if (!ids.length) return ctx.reply('Список ids пуст');
+    if (!ids.length) return ctx.reply('Список ids пуст или не относится к CS2.');
     const custom_id = `tg-${Date.now()}-${ids.join('-')}`;
     try {
       const res = await lis.buyForUser({ ids, partner, token, max_price, skip_unavailable: true, custom_id });
@@ -1135,6 +1170,8 @@ async function aiScanAndMaybeBuy() {
     const live = getLiveMinOffer(x.it.name);
     if (!live) continue;
     const it = { ...live };
+
+    if (!isCs2Id(it.id)) continue;
 
     const cid = `ai-${Date.now()}-${it.id}`;
     let payload, skins = [], spent = 0;
