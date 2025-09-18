@@ -58,6 +58,7 @@ const CFG = {
     AI_CACHE_UNLOCK_TOL_H: Number(process.env.AI_CACHE_UNLOCK_TOL_H || 6),
     AI_SERIES_POINTS_MAX: Number(process.env.AI_SERIES_POINTS_MAX || 96),
     AI_SERIES_STEP_MIN: Number(process.env.AI_SERIES_STEP_MIN || 60),
+    AI_ONLY_UNLOCKED_DEFAULT: Number(process.env.AI_ONLY_UNLOCKED_DEFAULT || 0),
 
     TG_BOT_TOKEN: process.env.TG_BOT_TOKEN || '',
     TG_CHAT_ID: process.env.TG_CHAT_ID || '',
@@ -134,15 +135,18 @@ CREATE TABLE IF NOT EXISTS price_snapshots (
  PRIMARY KEY (skin_name, ts)
 );
 CREATE INDEX IF NOT EXISTS ps_name_ts ON price_snapshots(skin_name, ts);
--- live-индекс последнего состояния по имени
-CREATE TABLE IF NOT EXISTS live_prices (
- skin_name TEXT PRIMARY KEY,
- skin_id   INTEGER,
- price     REAL NOT NULL,
- unlock_at TEXT,
- created_at TEXT,
- updated_at TEXT NOT NULL
+-- live-индекс последнего состояния по ЛОТУ (id), а не по имени
+CREATE TABLE IF NOT EXISTS live_offers (
+  skin_id   INTEGER PRIMARY KEY,
+  skin_name TEXT NOT NULL,
+  price     REAL NOT NULL,
+  unlock_at TEXT,
+  created_at TEXT,
+  updated_at TEXT NOT NULL,
+  active    INTEGER NOT NULL DEFAULT 1
 );
+CREATE INDEX IF NOT EXISTS lo_name_active ON live_offers(skin_name, active);
+CREATE INDEX IF NOT EXISTS lo_name_price ON live_offers(skin_name, price);
 -- кэш прогнозов
 CREATE TABLE IF NOT EXISTS forecasts_cache (
  skin_name TEXT PRIMARY KEY,
@@ -381,7 +385,9 @@ let centrifuge = null,
 // антифлуд на снимки: name->lastTs
 const snapGuard = new Map();
 // live-индекс также держим в памяти для скорости: Map(name=>row)
-const liveIndex = new Map();
+
+const offersById = new Map();            // id -> {id, name, price, unlock_at, created_at, updated_at, active}
+const minByName  = new Map();            // name -> {id, price}
 
 function canSnapshot(name) {
     const now = Date.now();
@@ -398,53 +404,73 @@ function canSnapshot(name) {
     return false;
 }
 
-function upsertLivePrice({
-    name,
-    id,
-    price,
-    unlock_at,
-    created_at
-}) {
-    if (!name || !Number.isFinite(Number(price))) return;
-    const nowIso = new Date().toISOString();
+function upsertOfferFromEvent({ id, name, price, unlock_at, created_at }) {
+  if (!id || !name || !Number.isFinite(Number(price))) return;
+  const nowIso = new Date().toISOString();
 
-    db.prepare(`
-    INSERT INTO live_prices (skin_name, skin_id, price, unlock_at, created_at, updated_at)
-    VALUES (?,?,?,?,?,?)
-    ON CONFLICT(skin_name) DO UPDATE SET
-      skin_id=excluded.skin_id,
+  // upsert в БД
+  db.prepare(`
+    INSERT INTO live_offers (skin_id, skin_name, price, unlock_at, created_at, updated_at, active)
+    VALUES (?,?,?,?,?,?,1)
+    ON CONFLICT(skin_id) DO UPDATE SET
+      skin_name=excluded.skin_name,
       price=excluded.price,
       unlock_at=excluded.unlock_at,
-      created_at=COALESCE(live_prices.created_at, excluded.created_at),
-      updated_at=excluded.updated_at
-  `).run(String(name), Number(id || 0), Number(price), unlock_at || null, created_at || nowIso, nowIso);
+      created_at=COALESCE(live_offers.created_at, excluded.created_at),
+      updated_at=excluded.updated_at,
+      active=1
+  `).run(Number(id), String(name), Number(price), unlock_at || null, created_at || nowIso, nowIso);
 
-    liveIndex.set(String(name), {
-        skin_name: String(name),
-        skin_id: Number(id || 0),
-        price: Number(price),
-        unlock_at: unlock_at || null,
-        created_at: created_at || nowIso,
-        updated_at: nowIso
-    });
+  // память по id
+  const rec = { id: Number(id), name: String(name), price: Number(price), unlock_at: unlock_at || null, created_at: created_at || nowIso, updated_at: nowIso, active: 1 };
+  offersById.set(rec.id, rec);
 
-    if (canSnapshot(name)) {
-        db.prepare(`
+  // поддержка минимума по имени
+  const cur = minByName.get(rec.name);
+  if (!cur || rec.price < cur.price) {
+    minByName.set(rec.name, { id: rec.id, price: rec.price });
+  }
+
+  // история (антифлуд не меняем)
+  if (canSnapshot(name)) {
+    db.prepare(`
       INSERT OR REPLACE INTO price_snapshots (skin_name, skin_id, price, ts)
       VALUES (?,?,?,?)
-    `).run(String(name), Number(id || 0), Number(price), nowIso);
-    }
+    `).run(String(name), Number(id), Number(price), nowIso);
+  }
 }
 
-// GC для liveIndex (и таблицы можно чистить отдельным джобом)
-function gcLiveIndex() {
-    const cutoff = Date.now() - CFG.WS_INDEX_GC_MIN * 60e3;
-    for (const [k, v] of liveIndex) {
-        if (!v?.updated_at) continue;
-        const t = Date.parse(v.updated_at);
-        if (Number.isFinite(t) && t < cutoff) liveIndex.delete(k);
+function removeOfferFromEvent({ id, name }) {
+  if (!id) return;
+  const row = offersById.get(Number(id));
+  const nowIso = new Date().toISOString();
+
+  // помечаем неактивным в БД
+  db.prepare(`
+    UPDATE live_offers
+    SET active=0, updated_at=?
+    WHERE skin_id=?
+  `).run(nowIso, Number(id));
+
+  offersById.delete(Number(id));
+
+  // если это был минимум — пересчитаем по имени
+  const nm = name || row?.name;
+  if (nm) {
+    const cur = minByName.get(nm);
+    if (cur && cur.id === Number(id)) {
+      // быстрый пересчёт из памяти (чтобы не ходить в БД):
+      let best = null;
+      for (const v of offersById.values()) {
+        if (v.name !== nm || v.active === 0) continue;
+        if (!best || v.price < best.price) best = { id: v.id, price: v.price };
+      }
+      if (best) minByName.set(nm, best);
+      else      minByName.delete(nm);
     }
+  }
 }
+
 
 function prettifyEvent(ev) {
     if (ev === 'obtained_skin_added') return '🆕 Добавлен';
@@ -455,43 +481,40 @@ function prettifyEvent(ev) {
 }
 
 function subscribePublic() {
-    const sub = centrifuge.newSubscription('public:obtained-skins');
+  // попытаемся включить recovery (если сервер Centrifugo настроен с history)
+  const sub = centrifuge.newSubscription('public:obtained-skins', { recover: true });
 
-    sub.on('publication', (ctx) => {
-        const d = ctx?.data || ctx;
-        const {
-            id,
-            name,
-            price,
-            unlock_at,
-            created_at,
-            event
-        } = d || {};
-        // удаление не трогаем индекс, пусть остаётся последняя цена до следующего апдейта
-        if (event === 'obtained_skin_deleted') {
-            LOG.debug('WS del', {
-                id,
-                name
-            });
-            return;
-        }
+  sub.on('publication', (ctx) => {
+    const d = ctx?.data || ctx;
+    const { id, name, price, unlock_at, created_at, event } = d || {};
+
+    switch (event) {
+      case 'obtained_skin_added':
+      case 'obtained_skin_price_changed':
+        upsertOfferFromEvent({ id, name, price, unlock_at, created_at });
+        break;
+
+      case 'obtained_skin_deleted':
+        removeOfferFromEvent({ id, name });
+        break;
+
+      default:
+        // на всякий случай апсертим, если пришёл price
         if (name && Number.isFinite(Number(price))) {
-            upsertLivePrice({
-                name,
-                id,
-                price,
-                unlock_at,
-                created_at
-            });
+          upsertOfferFromEvent({ id, name, price, unlock_at, created_at });
         }
-    });
+    }
+  });
 
-    sub.on('subscribing', (c) => LOG.debug(`WS subscribing public: ${c.code} ${c.reason||''}`));
-    sub.on('subscribed', () => LOG.info('WS subscribed: public:obtained-skins'));
-    sub.on('unsubscribed', (c) => LOG.warn(`WS unsubscribed public: ${c.code} ${c.reason||''}`));
-    sub.subscribe();
-    wsSubs.push(sub);
+  sub.on('subscribing', (c) => LOG.debug(`WS subscribing public: ${c.code} ${c.reason||''}`));
+  sub.on('subscribed', (ctx) => {
+    LOG.info(`WS subscribed: public:obtained-skins (recovered=${!!ctx?.recovered})`);
+  });
+  sub.on('unsubscribed', (c) => LOG.warn(`WS unsubscribed public: ${c.code} ${c.reason||''}`));
+  sub.subscribe();
+  wsSubs.push(sub);
 }
+
 
 function subscribePrivate(userId) {
     if (!userId) return;
@@ -889,108 +912,96 @@ async function forecastDirection({
 }
 
 // ранжирование ИЗ liveIndex (никакого REST)
-async function aiRankFromLive({
-    price_from,
-    price_to,
-    only_unlocked,
-    limit
-}) {
-    resetLLM();
-    const now = Date.now();
+async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
+  resetLLM();
+  const now = Date.now();
 
-    // соберём массив записей
-    let arr = Array.from(liveIndex.values());
+  // один активный минимальный лот на каждое имя
+  const rows = db.prepare(`
+        SELECT lo.*
+    FROM live_offers lo
+    JOIN (
+    SELECT skin_name, MIN(price) AS minp, MIN(skin_id) AS min_id
+    FROM live_offers
+    WHERE active=1
+    GROUP BY skin_name
+    ) m ON lo.skin_name = m.skin_name
+        AND lo.price = m.minp
+        AND lo.skin_id = m.min_id
+    WHERE lo.active = 1
+  `).all();
 
-    // фильтры
-    if (Number.isFinite(price_from)) arr = arr.filter(r => Number(r.price) >= price_from);
-    if (Number.isFinite(price_to)) arr = arr.filter(r => Number(r.price) <= price_to);
-    if (only_unlocked) {
-        arr = arr.filter(r => {
-            if (!r.unlock_at) return true;
-            const t = Date.parse(r.unlock_at);
-            return !Number.isFinite(t) || t <= now;
-        });
-    }
-
-    // уникальность по (name, price) и ограничение по лимиту сырья
-    const seen = new Set();
-    const uniq = [];
-    for (const r of arr) {
-        const k = `${r.skin_name}::${Number(r.price)||0}`;
-        if (seen.has(k)) continue;
-        seen.add(k);
-        uniq.push(r);
-        if (uniq.length >= CFG.AI_SCAN_LIMIT) break;
-    }
-
-    // предскоринг → выбор кандидатов для LLM
-    const pre = uniq.map(r => {
-        const fts = skinFeaturesFromLive(r);
-        const holdHours = (fts?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
-        const unlockH = Math.max(0, Math.round((fts?.unlock_hours || 0) + holdHours)); // для коэффициента
-        const ch7 = Number(fts?.hist_7d_change_pct || 0);
-        const riskPen = Number(fts?.hist_7d_std || 0) / Math.max(fts?.hist_7d_mean || 1, 1);
-        const gross = ch7 * (unlockH / 168);
-        const score = gross - 0.10 * Math.min(1.5, Math.max(0, riskPen));
-        return {
-            r,
-            fts,
-            score
-        };
+  // фильтры
+  let arr = rows;
+  if (Number.isFinite(price_from)) arr = arr.filter(r => Number(r.price) >= price_from);
+  if (Number.isFinite(price_to))   arr = arr.filter(r => Number(r.price) <= price_to);
+  if (only_unlocked) {
+    arr = arr.filter(r => {
+      if (!r.unlock_at) return true;
+      const t = Date.parse(r.unlock_at);
+      return !Number.isFinite(t) || t <= now;
     });
+  }
 
-    pre.sort((a, b) => b.score - a.score);
-    const K = (CFG.AI_LLM_MODE === 'llm') ? pre.length :
-        (CFG.AI_LLM_MODE === 'auto') ? CFG.AI_OPENAI_MAX_CALLS_PER_SCAN :
-        0;
-    const mark = new Set(pre.slice(0, K).map(x => x.r.skin_name));
+  // ограничим сырьё
+  arr = arr.slice(0, CFG.AI_SCAN_LIMIT);
 
-    // прогноз
-    const scored = [];
-    for (const row of pre) {
-        const r = row.r,
-            fts = row.fts;
-        const allowLLM = mark.has(r.skin_name) && CFG.AI_LLM_MODE !== 'off';
-        let f = await forecastDirection({
-            skinName: r.skin_name,
-            features: fts,
-            allowLLM
-        });
-        f.horizons = {
-            ...(f.horizons || {}),
-            price_usd: Number(fts.price_usd || 0)
-        };
-        const key = `${r.skin_id}|${r.price}|${r.created_at||''}|${r.unlock_at||''}`;
-        f = jitterForecast(f, key);
-        const grossHoldPct = Number(f?.exp_up_pct_hold || 0);
-        const netHoldPct = grossHoldPct - 2 * CFG.FEE_RATE;
-        scored.push({
-            it: {
-                id: r.skin_id,
-                name: r.skin_name,
-                price: Number(r.price),
-                unlock_at: r.unlock_at,
-                created_at: r.created_at
-            },
-            f,
-            netHoldPct,
-            netHoldUSD: (Number(r.price || 0) * netHoldPct)
-        });
-    }
+  // предскоринг/LLM как у вас сейчас (ниже — тот же код, только поля переименованы)
+  const pre = arr.map(r => {
+    const fts = skinFeaturesFromLive({ skin_name: r.skin_name, price: r.price, unlock_at: r.unlock_at, created_at: r.created_at });
+    const holdHours = (fts?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
+    const unlockH   = Math.max(0, Math.round((fts?.unlock_hours || 0) + holdHours));
+    const ch7       = Number(fts?.hist_7d_change_pct || 0);
+    const riskPen   = Number(fts?.hist_7d_std || 0) / Math.max(fts?.hist_7d_mean || 1, 1);
+    const gross     = ch7 * (unlockH / 168);
+    const score     = gross - 0.10 * Math.min(1.5, Math.max(0, riskPen));
+    return { r, fts, score };
+  });
 
-    scored.sort((a, b) => {
-        if (b.netHoldPct !== a.netHoldPct) return b.netHoldPct - a.netHoldPct;
-        const ap = Number(a?.it?.price),
-            bp = Number(b?.it?.price);
-        if (Number.isFinite(ap) && Number.isFinite(bp)) return ap - bp;
-        return 0;
+  pre.sort((a,b)=> b.score - a.score);
+  const K = (CFG.AI_LLM_MODE === 'llm') ? pre.length :
+            (CFG.AI_LLM_MODE === 'auto') ? CFG.AI_OPENAI_MAX_CALLS_PER_SCAN : 0;
+  const mark = new Set(pre.slice(0, K).map(x => x.r.skin_name));
+
+  const scored = [];
+  for (const row of pre) {
+    const r   = row.r;
+    const fts = row.fts;
+    const allowLLM = mark.has(r.skin_name) && CFG.AI_LLM_MODE !== 'off';
+    let f = await forecastDirection({ skinName: r.skin_name, features: fts, allowLLM });
+    f.horizons = { ...(f.horizons||{}), price_usd: Number(fts.price_usd || 0) };
+    const key = `${r.skin_id}|${r.price}|${r.created_at||''}|${r.unlock_at||''}`;
+    f = jitterForecast(f, key);
+    const grossHoldPct = Number(f?.exp_up_pct_hold || 0);
+    const netHoldPct   = grossHoldPct - 2 * CFG.FEE_RATE;
+
+    scored.push({
+      it: {
+        id: r.skin_id,
+        name: r.skin_name,
+        price: Number(r.price),
+        unlock_at: r.unlock_at,
+        created_at: r.created_at
+      },
+      f,
+      netHoldPct,
+      netHoldUSD: Number(r.price || 0) * netHoldPct
     });
+  }
 
-    const n = Number.isFinite(Number(limit)) ? Number(limit) : 10;
-    const anyAbove = scored.some(x => x.netHoldPct >= CFG.MIN_EDGE_HOLD_PCT);
-    const pool = anyAbove ? scored.filter(x => x.netHoldPct >= CFG.MIN_EDGE_HOLD_PCT) : scored;
-    return pool.slice(0, n);
+  scored.sort((a,b)=>{
+    if (b.netHoldPct !== a.netHoldPct) return b.netHoldPct - a.netHoldPct;
+    const ap = Number(a?.it?.price), bp = Number(b?.it?.price);
+    if (Number.isFinite(ap) && Number.isFinite(bp)) return ap - bp;
+    return 0;
+  });
+
+  const n        = Number.isFinite(Number(limit)) ? Number(limit) : 10;
+  const anyAbove = scored.some(x => x.netHoldPct >= CFG.MIN_EDGE_HOLD_PCT);
+  const pool     = anyAbove ? scored.filter(x => x.netHoldPct >= CFG.MIN_EDGE_HOLD_PCT) : scored;
+  return pool.slice(0, n);
 }
+
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 7) Сигналы TP/SL (цены берутся из liveIndex либо из БД при форматировании)
@@ -1016,24 +1027,48 @@ function trackSkinForSignals(name, entry, unlockHours = 0) {
         not_before
     });
 }
-async function refreshSignals() {
-    if (!watchMap.size) return;
-    const now = Date.now();
-    for (const [name, rec] of watchMap) {
-        const live = liveIndex.get(name);
-        if (!live) continue;
-        const p = Number(live.price || rec.last);
-        rec.last = p;
-        if (now < rec.not_before) continue;
-        if (p >= rec.tp) {
-            notifyOnce(`📈 TP достигнут\n${name}: ${p.toFixed(2)} ≥ ${rec.tp.toFixed(2)} (вход ${rec.entry.toFixed(2)})`, `tp:${name}:${rec.tp.toFixed(2)}`, 3600e3);
-            watchMap.delete(name);
-        } else if (p <= rec.sl) {
-            notifyOnce(`📉 SL сработал\n${name}: ${p.toFixed(2)} ≤ ${rec.sl.toFixed(2)} (вход ${rec.entry.toFixed(2)})`, `sl:${name}:${rec.sl.toFixed(2)}`, 3600e3);
-            watchMap.delete(name);
-        }
-    }
+
+
+function getCurrentMinPriceByName(name) {
+  const row = db.prepare(`
+    SELECT lo.price
+    FROM live_offers lo
+    JOIN (
+      SELECT skin_name, MIN(price) AS minp, MIN(skin_id) AS min_id
+      FROM live_offers
+      WHERE active=1 AND skin_name=?
+      GROUP BY skin_name
+    ) m ON lo.skin_name = m.skin_name AND lo.price = m.minp AND lo.skin_id = m.min_id
+    WHERE lo.active=1
+    LIMIT 1
+  `).get(name);
+  return row ? Number(row.price) : NaN;
 }
+
+
+async function refreshSignals() {
+  if (!watchMap.size) return;
+  const now = Date.now();
+
+  for (const [name, rec] of watchMap) {
+    const p = getCurrentMinPriceByName(name);
+    if (!Number.isFinite(p)) continue;
+
+    rec.last = p;
+    if (now < rec.not_before) continue;
+
+    if (p >= rec.tp) {
+      notifyOnce(`📈 TP достигнут\n${name}: ${p.toFixed(2)} ≥ ${rec.tp.toFixed(2)} (вход ${rec.entry.toFixed(2)})`,
+                 `tp:${name}:${rec.tp.toFixed(2)}`, 3600e3);
+      watchMap.delete(name);
+    } else if (p <= rec.sl) {
+      notifyOnce(`📉 SL сработал\n${name}: ${p.toFixed(2)} ≤ ${rec.sl.toFixed(2)} (вход ${rec.entry.toFixed(2)})`,
+                 `sl:${name}:${rec.sl.toFixed(2)}`, 3600e3);
+      watchMap.delete(name);
+    }
+  }
+}
+
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 8) Telegram / Команды
