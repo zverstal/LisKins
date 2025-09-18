@@ -1101,6 +1101,7 @@ function getCurrentMinPriceByName(name) {
 
 // Все активные лоты по имени, самые дешёвые N
 function getCheapestOffersByName(name, limit=10) {
+  const n = Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.trunc(limit))) : 10;
   return db.prepare(`
     SELECT skin_id, price, unlock_at, created_at, updated_at
     FROM live_offers
@@ -1441,17 +1442,45 @@ bot.command('ws_dump', async (ctx)=>{
 
 // Минимальная цена и дешёвые лоты по имени
 // /min_price <имя точное> [n=10]
-bot.command('min_price', async (ctx)=>{
-  const raw = (ctx.match||'').trim();
-  if (!raw) return ctx.reply('Использование: /min_price <точное имя> [n=10]');
-  const parts = raw.split(/\s+/);
-  const name = parts[0];
-  const n = Math.max(1, Math.min(50, Number(parts[1]||10)));
-  const min = getCurrentMinPriceByName(name);
-  const cheapest = getCheapestOffersByName(name, n);
-  const header = min ? `Минимум: $${min.price.toFixed(2)} (id ${min.id})` : 'Минимум: не найден';
-  const list = cheapest.map((o,i)=> `${i+1}. $${o.price.toFixed(2)} • id ${o.id} • unlock_at: ${o.unlock_at||'—'}`).join('\n') || 'нет активных лотов';
-  await sendLongHtml(ctx, `🔎 <b>${escHtml(name)}</b>\n\n${escHtml(header)}\n\n<pre>${escHtml(list)}</pre>`);
+// /min_price <точное имя> [n=10]  — имя может содержать пробелы и символы | (pipe)
+bot.command('min_price', async (ctx) => {
+  try {
+    const raw = (ctx.match || '').trim();
+    if (!raw) return ctx.reply('Использование: /min_price <точное имя> [n=10]');
+
+    let name = raw;
+    let n = 10;
+
+    // Если есть явный ключ n=NN — вытащим его
+    const mKV = raw.match(/\bn=(\d+)\b/i);
+    if (mKV) {
+      n = Math.max(1, Math.min(50, parseInt(mKV[1], 10)));
+      name = raw.replace(/\s*\bn=\d+\b\s*/i, '').trim();
+    } else {
+      // Иначе попробуем: если последний токен — число, считаем это n
+      const tokens = raw.split(/\s+/);
+      const last = tokens[tokens.length - 1];
+      if (/^\d+$/.test(last)) {
+        n = Math.max(1, Math.min(50, parseInt(last, 10)));
+        name = tokens.slice(0, -1).join(' ');
+      }
+    }
+
+    if (!name) return ctx.reply('Укажите имя предмета.');
+
+    const min = getCurrentMinPriceByName(name);
+    const cheapest = getCheapestOffersByName(name, n);
+
+    const header = min ? `Минимум: $${min.price.toFixed(2)} (id ${min.id})`
+                       : 'Минимум: не найден';
+    const list = cheapest.length
+      ? cheapest.map((o,i)=> `${i+1}. $${o.price.toFixed(2)} • id ${o.id} • unlock_at: ${o.unlock_at||'—'}`).join('\n')
+      : 'нет активных лотов';
+
+    await sendLongHtml(ctx, `🔎 <b>${escHtml(name)}</b>\n\n${escHtml(header)}\n\n<pre>${escHtml(list)}</pre>`);
+  } catch (e) {
+    ctx.reply(`min_price ошибка: ${e.message || e}`);
+  }
 });
 
 // Отладочная версия ai_scan — показывает и красивый вывод, и сырой JSON
