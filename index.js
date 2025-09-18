@@ -87,7 +87,7 @@ const LOG = {
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const clampSym = (x, a = -0.5, b = 0.5) => Math.max(a, Math.min(b, Number(x) || 0));
+const clampSym = (x, a = -0.25, b = 0.25) => Math.max(a, Math.min(b, Number(x) || 0));
 
 // ──────────────────────────────────────────────────────────────────────────────
 /** 2) БД: история/кэш прогнозов/бумажный учёт */
@@ -532,7 +532,32 @@ function jitterForecast(f) {
   return out;
 }
 function heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta }) {
-  const expH = clampSym(ch7 * (Hhold_eff/168)), expS = clampSym(ch7 * (Hshort/168));
+  // нормируем вклад горизонта максимум до 1 (7 суток)
+  const horizK_hold  = Math.min(1, Hhold_eff / 168);
+  const horizK_short = Math.min(1, Hshort     / 168);
+
+  // «сырой» прогноз по тренду
+  let expH = ch7 * horizK_hold;
+  let expS = ch7 * horizK_short;
+
+  // мягкий кап ±25%
+  expH = clampSym(expH);
+  expS = clampSym(expS);
+
+  const cv = meta?.hist_7d?.cv ?? 0;            // коэффициент вариации
+const n7 = meta?.hist_7d?.samples ?? 0;
+
+const volPenalty = Math.max(0, Math.min(0.4, 0.3 * cv)); // до -40%
+const sampPenalty = (n7 < 6) ? 0.35 : 0;                  // мало точек → -35%
+
+const shrink = 1 - volPenalty - sampPenalty;
+expH *= Math.max(0, shrink);
+expS *= Math.max(0, shrink);
+
+// затем снова безопасно капим
+expH = clampSym(expH);
+expS = clampSym(expS);
+
   return {
     label: expH > 0.003 ? 'up' : (expH < -0.003 ? 'down' : 'flat'),
     probUp_short: prior_up * 0.6 + 0.4 * 0.5,
@@ -545,6 +570,7 @@ function heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta })
     horizons: meta
   };
 }
+
 function skinFeaturesFromLive(offer) {
   const now = Date.now();
   const created = offer.created_at ? Date.parse(offer.created_at) : now;
@@ -824,7 +850,7 @@ function formatScanMessage(ranked) {
     const name = escHtml(x.it.name), id = escHtml(x.it.id), price = Number(x.it.price||0);
     const puS = fmtPct(x.f.probUp_short), puH = fmtPct(x.f.probUp_hold);
     const dS = fmtPctSigned(x.f.exp_up_pct_short), uS = fmtUsdSigned(x.f.exp_up_usd_short||0);
-    const dH = fmtPctSigned(x.f.exp_up_pct_hold),  uH = fmtUsdSigned(x.f.exp_up_usd_hold||0);
+    const dH = fmtPctSigned(x.netHoldPct);  const uH = fmtUsdSigned(x.netHoldUSD || 0);
     const hh = x.f?.horizons?.hold_h ?? (CFG.HOLD_DAYS*24);
     const trend7 = x.f?.horizons?.hist_7d?.change_pct, samples7 = x.f?.horizons?.hist_7d?.samples;
     const histInfo = (typeof trend7 === 'number')
@@ -834,7 +860,7 @@ function formatScanMessage(ranked) {
     return `${emoji} <b>${i+1}. ${name}</b>
    Цена: <code>${fmtUsd(price)}</code> • ID: <code>${id}</code>
    Вероятность роста 3ч: <b>${puS}</b> • к продаже (~${hh}ч): <b>${puH}</b>
-   Ожидаемо 3ч: <b>${dS}</b> (${uS}) • к продаже: <b>${dH}</b> (${uH})
+   Ожидаемо 3ч: <b>${dS}</b> (${uS}) • к продаже (после комиссий): <b>${dH}</b> (${uH})
    ${histInfo}`.trim();
   });
   return `🔎 <b>Топ кандидаты</b>\n\n` + rows.join('\n\n');
@@ -1118,7 +1144,7 @@ async function aiScanAndMaybeBuy() {
       `ID покупки: ${payload?.purchase_id || 'N/A'}`,
       `Потрачено: ${spent.toFixed(2)} $ (комиссия ${(spent * CFG.FEE_RATE).toFixed(2)})`,
       `Баланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`,
-      `Прогноз: Δ3ч≈${fmtPctSigned(x.f.exp_up_pct_short)} (${fmtUsdSigned(x.f.exp_up_usd_short || 0)}), Δк продаже≈${fmtPctSigned(x.f.exp_up_pct_hold)} (${fmtUsdSigned(x.f.exp_up_usd_hold || 0)})`,
+      `Прогноз: Δ3ч≈${fmtPctSigned(x.f.exp_up_pct_short)} (${fmtUsdSigned(x.f.exp_up_usd_short || 0)}), Δк продаже (после комиссий)≈${fmtPctSigned(x.netHoldPct)} (${fmtUsdSigned(x.netHoldUSD || 0)})`,
       lines
     ].join('\n');
     notifyOnce(text, `buy:${payload?.purchase_id || it.id}`, 3600e3);
