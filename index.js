@@ -612,6 +612,7 @@ function appendLivePoint(series, livePrice, eps = CFG.PRICE_EPS) {
   return [...series, { ts: Date.now(), price: Number(livePrice) }];
 }
 
+
 function skinFeaturesFromLive(offer) {
   const now = Date.now();
   const created = offer.created_at ? Date.parse(offer.created_at) : now;
@@ -634,6 +635,7 @@ function skinFeaturesFromLive(offer) {
     stats: sStats
   };
 }
+
 
 async function forecastDirection({ skinName, features, allowLLM = true }) {
   const holdHours = (features?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
@@ -851,6 +853,7 @@ function once(key, ttl = DEDUP_TTL_MS) {
   return true;
 }
 function notifyOnce(text, key, ttl) { if (once(key, ttl)) notify(text); }
+
 function fmtPct(x, d=2){ const v=Number(x)*100; return Number.isFinite(v)? v.toFixed(d)+'%':'—'; }
 function fmtPctSigned(x,d=2){ const v=Number(x)*100; if(!Number.isFinite(v)) return '—'; const s=v>0?'+':v<0?'−':''; return `${s}${Math.abs(v).toFixed(d)}%`; }
 function fmtUsdSigned(x,d=2){ const v=Number(x); if(!Number.isFinite(v)) return '—'; const s=v>0?'+':v<0?'−':''; return `${s}$${Math.abs(v).toFixed(d)}`; }
@@ -947,7 +950,7 @@ if (botReady) {
     }
   });
 
-    // минимальная текущая
+  // минимальная текущая
   bot.command('min_price', async (ctx) => {
     try {
       const raw = (ctx.match || '').trim();
@@ -1005,8 +1008,7 @@ if (botReady) {
         netHoldPct: x.netHoldPct, netHoldUSD: x.netHoldUSD, horizons: x.f.horizons,
         lastChanges: x.lastChanges
       }));
-
-         await sendLongHtml(ctx, pretty + `\n\n<b>DEBUG JSON:</b>\n<pre>${escHtml(JSON.stringify(plain, null, 2))}</pre>`);
+      await sendLongHtml(ctx, pretty + `\n\n<b>DEBUG JSON:</b>\n<pre>${escHtml(JSON.stringify(plain, null, 2))}</pre>`);
     } catch (e) {
       await ctx.reply('ai_scan_dbg ошибка: ' + (e.response?.status || '') + ' ' + (e.message || ''));
     }
@@ -1068,6 +1070,7 @@ if (botReady) {
       ctx.reply('Ошибка покупки.');
     }
   });
+
   // учёт ручной продажи (PAPER)
   bot.command('sold', async (ctx) => {
     const p = (ctx.match || '').trim().split(/\s+/);
@@ -1111,6 +1114,7 @@ if (botReady) {
       ctx.reply('hist ошибка: ' + (e.message || e));
     }
   });
+
   // управление циклами и сокетами
   bot.command('ws_on', (ctx) => { startWs(); ctx.reply('WebSocket: ВКЛ'); });
   bot.command('ws_off', (ctx) => { stopWs(); ctx.reply('WebSocket: ВЫКЛ'); });
@@ -1121,7 +1125,8 @@ if (botReady) {
 
   bot.command('sig_on', (ctx) => { startSignalLoop(); ctx.reply('Сигналы TP/SL: ВКЛ'); });
   bot.command('sig_off', (ctx) => { stopSignalLoop(); ctx.reply('Сигналы TP/SL: ВЫКЛ'); });
- // перезагрузка каталога
+
+  // перезагрузка каталога
   bot.command('catalog_reload', async (ctx) => {
     try {
       const info = await loadCsgoCatalog();
