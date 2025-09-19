@@ -35,29 +35,36 @@ const CFG = {
   BUY_PARTNER: process.env.BUY_PARTNER || '',
   BUY_TOKEN: process.env.BUY_TOKEN || '',
   HOLD_DAYS: Number(process.env.HOLD_DAYS || 7),
-  AI_HORIZON_HOURS_SHORT: Number(process.env.AI_HORIZON_HOURS_SHORT || 3),
-  MIN_EDGE_HOLD_PCT: Number(process.env.MIN_EDGE_HOLD_PCT || 0),
 
+  // горизонты прогноза
+  AI_HORIZON_HOURS_SHORT: Number(process.env.AI_HORIZON_HOURS_SHORT || 3),
+
+  // режим LLM
   AI_LLM_MODE: (process.env.AI_LLM_MODE || 'auto').toLowerCase(), // off|auto|llm
   AI_OPENAI_MAX_CALLS_PER_SCAN: Number(process.env.AI_OPENAI_MAX_CALLS_PER_SCAN || 6),
   AI_OPENAI_MIN_MS_BETWEEN: Number(process.env.AI_OPENAI_MIN_MS_BETWEEN || 1200),
   AI_OPENAI_CACHE_TTL_MIN: Number(process.env.AI_OPENAI_CACHE_TTL_MIN || 180),
-  AI_CACHE_PRICE_TOL_PCT: Number(process.env.AI_CACHE_PRICE_TOL_PCT || 0.015),
-  AI_CACHE_UNLOCK_TOL_H: Number(process.env.AI_CACHE_UNLOCK_TOL_H || 6),
-  AI_SERIES_POINTS_MAX: Number(process.env.AI_SERIES_POINTS_MAX || 96),
+
+  // доп. настройки истории
+  AI_SERIES_POINTS_MAX: Number(process.env.AI_SERIES_POINTS_MAX || 256),
   AI_SERIES_STEP_MIN: Number(process.env.AI_SERIES_STEP_MIN || 60),
 
+  AI_CACHE_PRICE_TOL_PCT: Number(process.env.AI_CACHE_PRICE_TOL_PCT || 0.015),
+  AI_CACHE_UNLOCK_TOL_H: Number(process.env.AI_CACHE_UNLOCK_TOL_H || 6),
+
+  // Telegram
   TG_BOT_TOKEN: process.env.TG_BOT_TOKEN || '',
   TG_CHAT_ID: process.env.TG_CHAT_ID || '',
 
+  // Сервисное
   DB_FILE: process.env.DB_FILE || 'lis_trader.db',
   LOG_JSON: (process.env.LOG_JSON || '1') === '1',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'INFO').toUpperCase(),
 
-  // WebSocket / история
-  WS_SNAPSHOT_MIN_INTERVAL_SEC: Number(process.env.WS_SNAPSHOT_MIN_INTERVAL_SEC || 20),
+  // WebSocket
+  WS_SNAPSHOT_MIN_INTERVAL_SEC: Number(process.env.WS_SNAPSHOT_MIN_INTERVAL_SEC || 10),
 
-  // «Самая свежая цена»
+  // «Свежесть»
   FRESH_WAIT_MS: Number(process.env.FRESH_WAIT_MS || 200),
   FRESH_STALENESS_MS: Number(process.env.FRESH_STALENESS_MS || 1000),
 
@@ -67,8 +74,16 @@ const CFG = {
   CATALOG_URL_FULL: 'https://lis-skins.com/market_export_json/api_csgo_full.json',
   CATALOG_URL_UNLOCKED: 'https://lis-skins.com/market_export_json/api_csgo_unlocked.json',
   CATALOG_URL_LOCK_TPL: 'https://lis-skins.com/market_export_json/api_csgo_lock_{days}_days.json',
-};
 
+  // отображение «ленты цен» в ai_scan
+  SHOW_LAST_CHANGES: Number(process.env.SHOW_LAST_CHANGES || 8),
+
+  // сравнение цен
+  PRICE_EPS: Number(process.env.PRICE_EPS || 0.0001),
+
+  // ранжирование, минимальный edge на удержание (после комиссий)
+  MIN_EDGE_HOLD_PCT: Number(process.env.MIN_EDGE_HOLD_PCT || 0),
+};
 const IS_LIVE = CFG.MODE === 'LIVE';
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -90,7 +105,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const clampSym = (x, a = -0.25, b = 0.25) => Math.max(a, Math.min(b, Number(x) || 0));
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 2) БД: история/кэш прогнозов/бумажный учёт */
+// 2) БД
 // ──────────────────────────────────────────────────────────────────────────────
 fs.mkdirSync(path.dirname(CFG.DB_FILE), { recursive: true });
 const db = new Database(CFG.DB_FILE);
@@ -98,33 +113,37 @@ db.pragma('journal_mode = WAL');
 db.exec(`
 CREATE TABLE IF NOT EXISTS balance (id INTEGER PRIMARY KEY CHECK (id=1), USD REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS trades (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- side TEXT CHECK(side IN ('BUY','SELL')),
- skin_id TEXT, skin_name TEXT, qty INTEGER,
- price REAL, fee REAL, ts TEXT, mode TEXT
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  side TEXT CHECK(side IN ('BUY','SELL')),
+  skin_id TEXT, skin_name TEXT, qty INTEGER,
+  price REAL, fee REAL, ts TEXT, mode TEXT
 );
 CREATE TABLE IF NOT EXISTS purchases (
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- purchase_id TEXT, steam_id TEXT, custom_id TEXT,
- request_json TEXT, response_json TEXT, created_at TEXT, error TEXT
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  purchase_id TEXT, steam_id TEXT, custom_id TEXT,
+  request_json TEXT, response_json TEXT, created_at TEXT, error TEXT
 );
-CREATE TABLE IF NOT EXISTS price_snapshots (
- skin_name TEXT NOT NULL,
- skin_id   INTEGER,
- price     REAL NOT NULL,
- ts        TEXT NOT NULL,
- PRIMARY KEY (skin_name, ts)
+/* История точек по скину — ХРАНИМ ТОЛЬКО ИЗМЕНЕНИЯ ЦЕНЫ */
+CREATE TABLE IF NOT EXISTS price_points (
+  skin_name TEXT NOT NULL,
+  skin_id   INTEGER,
+  price     REAL NOT NULL,
+  ts        TEXT NOT NULL,
+  PRIMARY KEY (skin_name, ts)
 );
-CREATE INDEX IF NOT EXISTS ps_name_ts ON price_snapshots(skin_name, ts);
+CREATE INDEX IF NOT EXISTS pp_name_ts ON price_points(skin_name, ts);
+
+/* Кэш ответов AI */
 CREATE TABLE IF NOT EXISTS forecasts_cache (
- skin_name TEXT PRIMARY KEY,
- price_usd REAL NOT NULL,
- unlock_h  INTEGER NOT NULL,
- prior_up  REAL,
- response_json TEXT NOT NULL,
- ts        TEXT NOT NULL
+  skin_name TEXT PRIMARY KEY,
+  price_usd REAL NOT NULL,
+  unlock_h  INTEGER NOT NULL,
+  prior_up  REAL,
+  response_json TEXT NOT NULL,
+  ts        TEXT NOT NULL
 );
 `);
+
 (function initBalance() {
   if (IS_LIVE) return;
   const row = db.prepare('SELECT USD FROM balance WHERE id=1').get();
@@ -133,8 +152,20 @@ CREATE TABLE IF NOT EXISTS forecasts_cache (
 const getPaperBalance = () => db.prepare('SELECT USD FROM balance WHERE id=1').get()?.USD ?? CFG.START_BALANCE_USD;
 const setPaperBalance = (v) => db.prepare('UPDATE balance SET USD=? WHERE id=1').run(v);
 
+// helpers: история
+const selLastPrice = db.prepare('SELECT price FROM price_points WHERE skin_name=? ORDER BY ts DESC LIMIT 1');
+const insPoint = db.prepare('INSERT OR REPLACE INTO price_points (skin_name, skin_id, price, ts) VALUES (?,?,?,?)');
+function insertPointIfChanged({ skin_name, skin_id, price, ts }) {
+  const last = selLastPrice.get(skin_name);
+  const p = Number(price);
+  if (!Number.isFinite(p)) return false;
+  if (last && Math.abs(Number(last.price) - p) <= CFG.PRICE_EPS) return false; // цены одинаковые — не пишем
+  insPoint.run(skin_name, skin_id ?? null, p, ts);
+  return true;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
-/** 3) HTTP API для баланса/покупки/токена WS */
+// 3) HTTP API
 // ──────────────────────────────────────────────────────────────────────────────
 function authHeaders() {
   const h = { Accept: 'application/json' };
@@ -180,23 +211,20 @@ const lis = {
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 4) Каталог CS2 из JSON-экспортов + live индекс */
+// 4) Каталог + live-индекс
 // ──────────────────────────────────────────────────────────────────────────────
 let centrifuge = null, wsSubs = [], wsConnected = false;
 const DEBUG_WS_BUF_CAP = Number(process.env.DEBUG_WS_BUF_CAP || 500);
 const wsBuf = [];
 let wsSeq = 0;
 
-// live офферы и минимумы (только память)
 const offersById = new Map();     // id -> {id,name,price,unlock_at,created_at,updated_at,active,+catalog:*}
 const minByName  = new Map();     // name -> {id, price}
-const lastByNameTs = new Map();   // name -> ts последнего обновления минимума
+const lastByNameTs = new Map();   // name -> last update ts (ms)
 
-// каталог с расширенными полями
-const catalogById = new Map();    // id -> full item from export
-const catalogByName = new Map();  // name -> массив id (может быть несколько)
+const catalogById = new Map();    // id -> full item
+const catalogByName = new Map();  // name -> [ids]
 
-// история снапшотов (антифлуд)
 const snapGuard = new Map();
 
 // ——— отладка WS
@@ -256,8 +284,6 @@ function isCs2Name(name) {
 
 function upsertOffer({ id, name, price, unlock_at, created_at }) {
   if (!id || !name || !Number.isFinite(Number(price))) return;
-
-  // 🔒 фильтр по каталогу CS2
   if (!isCs2Id(id)) return;
   const nowIso = new Date().toISOString();
 
@@ -273,16 +299,15 @@ function upsertOffer({ id, name, price, unlock_at, created_at }) {
   offersById.set(rec.id, enrichWithCatalog(rec));
   setMin(rec.name, rec.id, rec.price);
 
-  // история (7д)
+  // история: пишем ТОЛЬКО ИЗМЕНЕНИЯ (EPS) и только когда прошёл антифлуд
   if (canSnapshot(rec.name)) {
-    db.prepare(`INSERT OR REPLACE INTO price_snapshots (skin_name, skin_id, price, ts) VALUES (?,?,?,?)`)
-      .run(rec.name, rec.id, rec.price, nowIso);
+    insertPointIfChanged({ skin_name: rec.name, skin_id: rec.id, price: rec.price, ts: nowIso });
   }
 }
 
 function removeOffer({ id, name }) {
   if (!id) return;
-  if (!isCs2Id(id)) return; // не наш домен — игнорим
+  if (!isCs2Id(id)) return;
   const row = offersById.get(Number(id));
   offersById.delete(Number(id));
   const nm = name || row?.name;
@@ -301,7 +326,7 @@ function removeOffer({ id, name }) {
   }
 }
 
-// ——— загрузка каталога CS2
+// ——— загрузка каталога
 function getCatalogUrl() {
   switch (CFG.CATALOG_MODE) {
     case 'unlocked': return CFG.CATALOG_URL_UNLOCKED;
@@ -315,28 +340,22 @@ async function loadCsgoCatalog() {
   const url = getCatalogUrl();
   LOG.info('Загружаю каталог CS2', { url });
   const { data } = await axios.get(url, { timeout: 30000 });
-  if (!data || !Array.isArray(data.items)) {
-    throw new Error('bad catalog format');
-  }
+  if (!data || !Array.isArray(data.items)) throw new Error('bad catalog format');
 
-  // очистим
   catalogById.clear();
   catalogByName.clear();
 
-  // наполним каталог и стартовые офферы/минимумы
   let added = 0;
   for (const it of data.items) {
     const id = Number(it.id);
     const name = String(it.name || '');
     if (!id || !name) continue;
 
-    // сохраняем полный item
     catalogById.set(id, it);
     const ids = catalogByName.get(name) || [];
     ids.push(id);
     catalogByName.set(name, ids);
 
-    // стартовая цена из каталога (до прихода WS)
     if (Number.isFinite(Number(it.price))) {
       upsertOffer({
         id,
@@ -349,24 +368,16 @@ async function loadCsgoCatalog() {
     }
   }
   LOG.info('Каталог CS2 загружен', { items: data.items.length, offers_seeded: added });
-   // 🧹 выкинуть всё, что не из нового каталога
-  for (const [id, off] of [...offersById]) {
-    if (!catalogById.has(id)) {
-      offersById.delete(id);
-    }
-  }
-  for (const [name, ref] of [...minByName]) {
-    if (!catalogById.has(ref.id)) {
-      minByName.delete(name);
-      lastByNameTs.delete(name);
-    }
-  }
+
+  // почистить офферы не из каталога
+  for (const [id] of [...offersById]) if (!catalogById.has(id)) offersById.delete(id);
+  for (const [name, ref] of [...minByName]) if (!catalogById.has(ref.id)) { minByName.delete(name); lastByNameTs.delete(name); }
 
   return { total: data.items.length, seeded: added, last_update: data.last_update || null };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 5) WebSocket */
+// 5) WebSocket
 // ──────────────────────────────────────────────────────────────────────────────
 function subscribePublic() {
   const sub = centrifuge.newSubscription('public:obtained-skins', { recover: true });
@@ -424,7 +435,7 @@ function stopWs() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 6) «Самая свежая цена»: ожидание и чтение */
+// 6) «Свежая цена»
 // ──────────────────────────────────────────────────────────────────────────────
 async function waitForFresh(name, { maxWaitMs = CFG.FRESH_WAIT_MS, maxStalenessMs = CFG.FRESH_STALENESS_MS } = {}) {
   const start = Date.now();
@@ -455,11 +466,10 @@ function* iterateLiveMins() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 7) История / признаки / прогноз */
+// 7) История из БД / признаки / прогноз (теперь — по всей истории)
 // ──────────────────────────────────────────────────────────────────────────────
-function getPriceSeries(name, hours = 168) {
-  const sinceIso = new Date(Date.now() - hours * 3600e3).toISOString();
-  const rows = db.prepare(`SELECT price, ts FROM price_snapshots WHERE skin_name=? AND ts>=? ORDER BY ts ASC`).all(name, sinceIso);
+function getSeriesAll(name) {
+  const rows = db.prepare(`SELECT price, ts FROM price_points WHERE skin_name=? ORDER BY ts ASC`).all(name);
   return rows.map(r => ({ ts: Date.parse(r.ts), price: Number(r.price) }))
              .filter(p => Number.isFinite(p.ts) && Number.isFinite(p.price));
 }
@@ -497,20 +507,22 @@ function toPctFromFirst(series) {
   const p0 = series[0].price; if (!Number.isFinite(p0) || p0<=0) return series.map(s=>({ ...s, pct:0 }));
   return series.map(s=>({ ts:s.ts, pct:(s.price - p0)/p0 }));
 }
-function getPriceChange7d(name, hours = 168) {
-  const sinceIso = new Date(Date.now() - hours * 3600e3).toISOString();
-  const rows = db.prepare(`SELECT price, ts FROM price_snapshots WHERE skin_name=? AND ts>=? ORDER BY ts ASC`).all(name, sinceIso);
-  if (rows.length < 2) return { sample_cnt: rows.length, change_pct: 0, change_usd: 0, price_then: null, price_now: null, mean_price: 0, std_price: 0 };
-  const price_now = rows[rows.length - 1].price, price_then = rows[0].price;
-  const change_usd = price_now - price_then, change_pct = price_then > 0 ? (change_usd / price_then) : 0;
-  const prices = rows.map(r => Number(r.price)).filter(Number.isFinite);
-  const mean = prices.reduce((s,x)=>s+x,0)/prices.length;
-  const variance = prices.reduce((s,x)=> s + (x-mean)*(x-mean), 0) / Math.max(1, prices.length-1);
+
+function summaryStats(series) {
+  if (!series.length) return { n:0, change_pct:0, change_abs:0, mean:0, std:0, cv:0 };
+  const n = series.length;
+  const p0 = series[0].price, pN = series[n-1].price;
+  const change_abs = pN - p0;
+  const change_pct = p0 > 0 ? change_abs / p0 : 0;
+  const prices = series.map(s=>s.price);
+  const mean = prices.reduce((s,x)=>s+x,0)/n;
+  const variance = prices.reduce((s,x)=> s + (x-mean)*(x-mean), 0) / Math.max(1, n-1);
   const std = Math.sqrt(variance);
-  return { sample_cnt: rows.length, price_then, price_now, change_usd, change_pct, mean_price: mean, std_price: std };
+  const cv = mean>0 ? std/mean : 0;
+  return { n, change_pct, change_abs, mean, std, cv };
 }
 
-// Прогноз (LLM+эвристика)
+// Прогноз (LLM + эвристика) на основе ВСЕЙ ИСТОРИИ
 let _llmCallsThisScan = 0, _lastLLMCallAt = 0;
 const resetLLM = () => { _llmCallsThisScan = 0; };
 async function guardLLM() {
@@ -556,32 +568,23 @@ function jitterForecast(f) {
   out.label = out.exp_up_pct_hold > 0.003 ? 'up' : (out.exp_up_pct_hold < -0.003 ? 'down' : 'flat');
   return out;
 }
-function heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta }) {
-  // нормируем вклад горизонта максимум до 1 (7 суток)
+
+function heuristicForecast({ Hshort, Hhold_eff, priceUsd, sStats, prior_up, meta }) {
+  // масштаб горизонта (эффективная «весовая» длина)
   const horizK_hold  = Math.min(1, Hhold_eff / 168);
   const horizK_short = Math.min(1, Hshort     / 168);
 
-  // «сырой» прогноз по тренду
-  let expH = ch7 * horizK_hold;
-  let expS = ch7 * horizK_short;
+  // базовый тренд = изменение за всю историю
+  let expH = sStats.change_pct * horizK_hold;
+  let expS = sStats.change_pct * horizK_short;
 
-  // мягкий кап ±25%
-  expH = clampSym(expH);
-  expS = clampSym(expS);
+  // штрафы за волатильность и скудную выборку
+  const volPenalty = Math.max(0, Math.min(0.4, 0.3 * (sStats.cv || 0)));
+  const sampPenalty = (sStats.n < 6) ? 0.35 : 0;
 
-  const cv = meta?.hist_7d?.cv ?? 0;            // коэффициент вариации
-const n7 = meta?.hist_7d?.samples ?? 0;
-
-const volPenalty = Math.max(0, Math.min(0.4, 0.3 * cv)); // до -40%
-const sampPenalty = (n7 < 6) ? 0.35 : 0;                  // мало точек → -35%
-
-const shrink = 1 - volPenalty - sampPenalty;
-expH *= Math.max(0, shrink);
-expS *= Math.max(0, shrink);
-
-// затем снова безопасно капим
-expH = clampSym(expH);
-expS = clampSym(expS);
+  const shrink = Math.max(0, 1 - volPenalty - sampPenalty);
+  expH = clampSym(expH * shrink);
+  expS = clampSym(expS * shrink);
 
   return {
     label: expH > 0.003 ? 'up' : (expH < -0.003 ? 'down' : 'flat'),
@@ -596,22 +599,39 @@ expS = clampSym(expS);
   };
 }
 
+// helper: аккуратно склеиваем live-цену с историей (без записи в БД)
+function appendLivePoint(series, livePrice, eps = CFG.PRICE_EPS) {
+  if (!Number.isFinite(livePrice)) return series;
+  if (!series.length) return [{ ts: Date.now(), price: Number(livePrice) }];
+  const last = series[series.length - 1];
+  if (Math.abs(last.price - livePrice) <= eps) {
+    // цена не изменилась — можно просто «освежить» метку времени,
+    // либо оставить как есть. Я оставляю как есть, чтобы не искажать длительность.
+    return series;
+  }
+  return [...series, { ts: Date.now(), price: Number(livePrice) }];
+}
+
 function skinFeaturesFromLive(offer) {
   const now = Date.now();
   const created = offer.created_at ? Date.parse(offer.created_at) : now;
   const unlock_at = offer.unlock_at ? Date.parse(offer.unlock_at) : NaN;
   const unlockH = Number.isFinite(unlock_at) && unlock_at > now ? Math.ceil((unlock_at - now)/3600e3) : 0;
-  const hist7 = getPriceChange7d(offer.name, 168);
+
+  // вся история из БД
+  let rawSeries = getSeriesAll(offer.name);
+  // ВАЖНО: доклеиваем свежий тик из WS только для LLM/аналитики
+  rawSeries = appendLivePoint(rawSeries, Number(offer.price));
+
+  const sStats = summaryStats(rawSeries);
+
   return {
     price_usd: Number(offer.price || 0),
     age_min: Math.max(0, Math.round((now - created)/6e4)),
     unlock_hours: unlockH,
     hold_days_after_buy: CFG.HOLD_DAYS,
-    hist_7d_change_pct: hist7.change_pct,
-    hist_7d_change_usd: hist7.change_usd,
-    hist_7d_mean: hist7.mean_price,
-    hist_7d_std: hist7.std_price,
-    hist_7d_samples: hist7.sample_cnt
+    series_raw: rawSeries,
+    stats: sStats
   };
 }
 
@@ -621,23 +641,22 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
   const Hshort = CFG.AI_HORIZON_HOURS_SHORT;
   const priceUsd = Number(features?.price_usd || 0);
 
-  const ch7 = Number(features?.hist_7d_change_pct || 0);
-  const mean7 = Number(features?.hist_7d_mean || 0);
-  const std7 = Number(features?.hist_7d_std || 0);
-  const n7 = Number(features?.hist_7d_samples || 0);
-  const denom = mean7 > 0 ? mean7 : (priceUsd > 0 ? priceUsd : 1);
-  const cv = Math.max(0, Math.min(1.5, std7 / denom));
-  let prior_up = 0.5 + Math.max(-0.20, Math.min(0.20, ch7 * 0.8));
-  prior_up -= 0.10 * Math.min(1, cv);
-  if (n7 < 6) prior_up = 0.5 * 0.6 + prior_up * 0.4;
+  // prior на рост: мягкая функция тренда и «здоровья» ряда
+  const sStats = features?.stats || { n:0, change_pct:0, cv:0 };
+  let prior_up = 0.5 + Math.max(-0.20, Math.min(0.20, (sStats.change_pct || 0) * 0.8));
+  prior_up -= 0.10 * Math.min(1, sStats.cv || 0);
+  if ((sStats.n || 0) < 6) prior_up = 0.5 * 0.6 + prior_up * 0.4;
   prior_up = Math.max(0.05, Math.min(0.95, prior_up));
 
-  const meta = { short_h: Hshort, hold_h: Hhold_eff, price_usd: priceUsd, prior_up,
-    hist_7d: { change_pct: ch7, mean: mean7, std: std7, samples: n7, cv } };
+  const meta = {
+    short_h: Hshort, hold_h: Hhold_eff, price_usd: priceUsd, prior_up,
+    series_len: sStats.n, cv: sStats.cv, change_pct_total: sStats.change_pct, mean: sStats.mean, std: sStats.std
+  };
 
+  // кэш
   const cached = getCachedForecast(skinName, priceUsd, Hhold_eff, prior_up);
   if (!CFG.OPENAI_API_KEY || CFG.AI_LLM_MODE === 'off') {
-    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta });
+    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, sStats, prior_up, meta });
     return jitterForecast(out);
   }
   if (cached) {
@@ -645,18 +664,18 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
     return jitterForecast(out);
   }
   if (!allowLLM) {
-    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta });
+    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, sStats, prior_up, meta });
     return jitterForecast(out);
   }
   try { await guardLLM(); } catch {
-    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta });
+    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, sStats, prior_up, meta });
     return jitterForecast(out);
   }
 
-  // компактный ряд
+  // компактный ряд (вся история -> ресемплинг -> даунсэмпл)
   let seriesAbs = [], seriesPct = [];
   try {
-    const raw = getPriceSeries(skinName, 168);
+    const raw = features?.series_raw || [];
     const step = resampleByStep(raw, CFG.AI_SERIES_STEP_MIN);
     const cap = downsamplePAA(step, CFG.AI_SERIES_POINTS_MAX);
     seriesAbs = cap.map(x => Number(x.price.toFixed(4)));
@@ -665,8 +684,8 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
 
   const sys = [
     'Ты — аналитик ценовых движений скинов CS2.',
-    `Оцени два горизонта: Hshort=${Hshort}ч и Hhold=${Hhold_eff}ч (unlock + Trade Protection).`,
-    'Даны 7-дневные метрики и prior_up.',
+    'Оцени два горизонта: короткий (Hshort) и «к продаже» (Hhold = unlock + Trade Protection).',
+    'Даны ВСЕ доступные точки истории (сжатые), prior_up и сводные метрики.',
     'Верни ТОЛЬКО JSON: { "label":"up|down|flat", "probUp_short":0..1, "probUp_hold":0..1, "exp_up_pct_short":-1..1, "exp_up_usd_short":n, "exp_up_pct_hold":-1..1, "exp_up_usd_hold":n }'
   ].join('\n');
 
@@ -675,10 +694,9 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
     price_usd: priceUsd,
     horizons: { short_h: Hshort, hold_h: Hhold_eff },
     prior_up,
-    hist_7d: { change_pct: ch7, mean: mean7, std: std7, samples: n7, cv },
+    stats: sStats,
     series_abs: seriesAbs,
-    series_pct_from_first: seriesPct,
-    features
+    series_pct_from_first: seriesPct
   };
 
   try {
@@ -707,7 +725,7 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
     return j2;
   } catch (e) {
     LOG.warn('LLM error, heuristic fallback', { msg: e?.message, status: e?.response?.status });
-    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, ch7, prior_up, meta });
+    const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, sStats, prior_up, meta });
     const j2 = jitterForecast(out);
     putCachedForecast(skinName, priceUsd, Hhold_eff, prior_up, j2);
     return j2;
@@ -715,7 +733,7 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 8) Ранжирование по live-минимумам */
+// 8) Ранжирование по live-минимумам
 // ──────────────────────────────────────────────────────────────────────────────
 async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
   resetLLM();
@@ -734,13 +752,14 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
     pool.push(off);
   }
 
+  // предварительный скор без LLM — по всей истории
   const pre = pool.map(off => {
     const fts = skinFeaturesFromLive(off);
     const holdHours = (fts?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
     const unlockH   = Math.max(0, Math.round((fts?.unlock_hours || 0) + holdHours));
-    const ch7       = Number(fts?.hist_7d_change_pct || 0);
-    const riskPen   = Number(fts?.hist_7d_std || 0) / Math.max(fts?.hist_7d_mean || 1, 1);
-    const gross     = ch7 * (unlockH / 168);
+    const trend     = Number(fts?.stats?.change_pct || 0);
+    const riskPen   = Number(fts?.stats?.cv || 0);
+    const gross     = trend * (unlockH / 168);
     const score     = gross - 0.10 * Math.min(1.5, Math.max(0, riskPen));
     return { off, fts, score };
   }).sort((a,b)=> b.score - a.score);
@@ -767,7 +786,8 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
 
     scored.push({
       it: { id: off.id, name: off.name, price: Number(off.price), unlock_at: off.unlock_at, created_at: off.created_at },
-      f, netHoldPct, netHoldUSD: Number(off.price || 0) * netHoldPct
+      f, netHoldPct, netHoldUSD: Number(off.price || 0) * netHoldPct,
+      lastChanges: (fts?.series_raw || []).slice(-CFG.SHOW_LAST_CHANGES).map(x => Number(x.price.toFixed(4)))
     });
   }
 
@@ -785,7 +805,7 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 9) TP/SL и баланс */
+// 9) TP/SL и баланс
 // ──────────────────────────────────────────────────────────────────────────────
 const watchMap = new Map(); // name -> {entry,tp,sl,last, not_before}
 function trackSkinForSignals(name, entry, unlockHours = 0) {
@@ -814,7 +834,7 @@ const paperSpend  = (amt)=> { if (!amt) return; setPaperBalance(getPaperBalance(
 const paperIncome = (amt)=> { if (!amt) return; setPaperBalance(getPaperBalance() + amt*(1-CFG.FEE_RATE)); };
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** 10) Telegram */
+// 10) Telegram
 // ──────────────────────────────────────────────────────────────────────────────
 const bot = CFG.TG_BOT_TOKEN ? new Bot(CFG.TG_BOT_TOKEN) : null;
 function notify(text) {
@@ -831,7 +851,6 @@ function once(key, ttl = DEDUP_TTL_MS) {
   return true;
 }
 function notifyOnce(text, key, ttl) { if (once(key, ttl)) notify(text); }
-
 function fmtPct(x, d=2){ const v=Number(x)*100; return Number.isFinite(v)? v.toFixed(d)+'%':'—'; }
 function fmtPctSigned(x,d=2){ const v=Number(x)*100; if(!Number.isFinite(v)) return '—'; const s=v>0?'+':v<0?'−':''; return `${s}${Math.abs(v).toFixed(d)}%`; }
 function fmtUsdSigned(x,d=2){ const v=Number(x); if(!Number.isFinite(v)) return '—'; const s=v>0?'+':v<0?'−':''; return `${s}$${Math.abs(v).toFixed(d)}`; }
@@ -877,16 +896,14 @@ function formatScanMessage(ranked) {
     const dS = fmtPctSigned(x.f.exp_up_pct_short), uS = fmtUsdSigned(x.f.exp_up_usd_short||0);
     const dH = fmtPctSigned(x.netHoldPct);  const uH = fmtUsdSigned(x.netHoldUSD || 0);
     const hh = x.f?.horizons?.hold_h ?? (CFG.HOLD_DAYS*24);
-    const trend7 = x.f?.horizons?.hist_7d?.change_pct, samples7 = x.f?.horizons?.hist_7d?.samples;
-    const histInfo = (typeof trend7 === 'number')
-      ? ['История цен за 7 дней:', `• Тренд: <b>${fmtPctSigned(trend7)}</b>`, Number.isFinite(samples7)?`• Точек наблюдений: <b>${samples7}</b>`:''].filter(Boolean).join('\n   ')
-      : '';
+    // новая «лента изменений»
+    const lane = (x.lastChanges || []).length ? `[${x.lastChanges.map(n=>Number(n.toFixed ? n.toFixed(2) : n).toString()).join(', ')}]` : '—';
     const emoji = x.netHoldPct>0?'🟢':(x.netHoldPct<0?'🔴':'⚪️');
     return `${emoji} <b>${i+1}. ${name}</b>
    Цена: <code>${fmtUsd(price)}</code> • ID: <code>${id}</code>
    Вероятность роста 3ч: <b>${puS}</b> • к продаже (~${hh}ч): <b>${puH}</b>
    Ожидаемо 3ч: <b>${dS}</b> (${uS}) • к продаже (после комиссий): <b>${dH}</b> (${uH})
-   ${histInfo}`.trim();
+   Изменения: <code>${lane}</code>`.trim();
   });
   return `🔎 <b>Топ кандидаты</b>\n\n` + rows.join('\n\n');
 }
@@ -905,48 +922,37 @@ if (botReady) {
     ctx.reply(`Текущий баланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`);
   });
 
-  // последние WS события
-bot.command('ws_recent', async (ctx) => {
-  try {
-    const raw = (ctx.match || '').trim();
-    let n = 50, filter = '', cs2Only = false;
-
-    if (raw) {
-      for (const tok of raw.split(/\s+/)) {
-        const m1 = /^n=(\d+)$/.exec(tok);       if (m1) { n = Math.max(1, Math.min(500, Number(m1[1]))); continue; }
-        const m2 = /^filter=(.+)$/.exec(tok);    if (m2) { filter = m2[1]; continue; }
-        const m3 = /^cs2=(\d+)$/.exec(tok);      if (m3) { cs2Only = Number(m3[1]) === 1; continue; }
+  // последние WS
+  bot.command('ws_recent', async (ctx) => {
+    try {
+      const raw = (ctx.match || '').trim();
+      let n = 50, filter = '', cs2Only = false;
+      if (raw) {
+        for (const tok of raw.split(/\s+/)) {
+          const m1 = /^n=(\d+)$/.exec(tok);       if (m1) { n = Math.max(1, Math.min(500, Number(m1[1]))); continue; }
+          const m2 = /^filter=(.+)$/.exec(tok);    if (m2) { filter = m2[1]; continue; }
+          const m3 = /^cs2=(\d+)$/.exec(tok);      if (m3) { cs2Only = Number(m3[1]) === 1; continue; }
+        }
       }
+      let items = wsBuf.filter(r => !filter || String(r.name || '').toLowerCase().includes(filter.toLowerCase()));
+      if (cs2Only) items = items.filter(r => isCs2Id(r.id));
+      items = items.slice(-n);
+      if (!items.length) return ctx.reply('WS событий нет (под ваш фильтр).');
+      const lines = items.map(r =>
+        `${r.seq}. ${r.t} ${r.kind} ${r.event || ''}\n   ${r.name || '(—)'} #${r.id || '—'}  ${r.price != null ? Number(r.price).toFixed(2) + ' $' : '—'}`
+      );
+      await sendLongHtml(ctx, `<b>Последние WS события</b>\n\n<pre>${escHtml(lines.join('\n'))}</pre>`);
+    } catch (e) {
+      ctx.reply(`ws_recent ошибка: ${e.message || e}`);
     }
+  });
 
-    let items = wsBuf
-      .filter(r => !filter || String(r.name || '').toLowerCase().includes(filter.toLowerCase()));
-
-    // Показываем только события, где id присутствует в нашем CS2-каталоге
-    if (cs2Only) items = items.filter(r => isCs2Id(r.id));
-
-    items = items.slice(-n);
-    if (!items.length) return ctx.reply('WS событий нет (под ваш фильтр).');
-
-    const lines = items.map(r =>
-      `${r.seq}. ${r.t} ${r.kind} ${r.event || ''}\n   ${r.name || '(—)'} #${r.id || '—'}  ${r.price != null ? Number(r.price).toFixed(2) + ' $' : '—'}`
-    );
-
-    await sendLongHtml(ctx, `<b>Последние WS события</b>\n\n<pre>${escHtml(lines.join('\n'))}</pre>`);
-  } catch (e) {
-    ctx.reply(`ws_recent ошибка: ${e.message || e}`);
-  }
-});
-
-
-    // минимальная текущая (самая свежая) цена
-  // /min_price <точное имя> [n=10]
+    // минимальная текущая
   bot.command('min_price', async (ctx) => {
     try {
       const raw = (ctx.match || '').trim();
       if (!raw) return ctx.reply('Использование: /min_price <точное имя> [n=10]');
       let name = raw, n = 10;
-
       const mKV = raw.match(/\bn=(\d+)\b/i);
       if (mKV) {
         n = Math.max(1, Math.min(50, parseInt(mKV[1], 10)));
@@ -965,11 +971,9 @@ bot.command('ws_recent', async (ctx) => {
       const min = getLiveMinOffer(name);
       const header = min ? `Минимум (свежий): $${Number(min.price).toFixed(2)} (id ${min.id})` : 'Минимум: не найден';
 
-      // соберём n самых дешёвых из памяти прямо сейчас
       const cheapest = [];
       for (const off of offersById.values()) if (off.name === name && isCs2Id(off.id)) cheapest.push(off);
       cheapest.sort((a, b) => a.price === b.price ? a.id - b.id : a.price - b.price);
-
       const list = cheapest.slice(0, n).map((o, i) =>
         `${i + 1}. $${Number(o.price).toFixed(2)} • id ${o.id} • unlock_at: ${o.unlock_at || '—'}`
       );
@@ -982,27 +986,27 @@ bot.command('ws_recent', async (ctx) => {
     }
   });
 
-   // отладочный ai_scan (с JSON)
+  // отладочный ai_scan (с JSON)
   bot.command('ai_scan_dbg', async (ctx) => {
     try {
       const kv = {}; const raw = (ctx.match ?? '').trim();
       if (raw) for (const t of raw.split(/\s+/)) { const m = /^([^=\s]+)=(.+)$/.exec(t); if (m) kv[m[1]] = m[2]; }
-
       const ranked = await aiRankFromLive({
         price_from: kv.price_from !== undefined ? Number(kv.price_from) : CFG.AI_MIN_PRICE_USD,
         price_to: kv.price_to !== undefined ? Number(kv.price_to) : CFG.AI_MAX_PRICE_USD,
         only_unlocked: Number(kv.only_unlocked || 0),
         limit: kv.limit !== undefined ? Number(kv.limit) : 10
       });
-
       const pretty = formatScanMessage(ranked);
       const plain = ranked.map(x => ({
         id: x.it.id, name: x.it.name, price: x.it.price,
         probUp_short: x.f.probUp_short, probUp_hold: x.f.probUp_hold,
         exp_up_pct_short: x.f.exp_up_pct_short, exp_up_pct_hold: x.f.exp_up_pct_hold,
-        netHoldPct: x.netHoldPct, netHoldUSD: x.netHoldUSD, horizons: x.f.horizons
+        netHoldPct: x.netHoldPct, netHoldUSD: x.netHoldUSD, horizons: x.f.horizons,
+        lastChanges: x.lastChanges
       }));
-      await sendLongHtml(ctx, pretty + `\n\n<b>DEBUG JSON:</b>\n<pre>${escHtml(JSON.stringify(plain, null, 2))}</pre>`);
+
+         await sendLongHtml(ctx, pretty + `\n\n<b>DEBUG JSON:</b>\n<pre>${escHtml(JSON.stringify(plain, null, 2))}</pre>`);
     } catch (e) {
       await ctx.reply('ai_scan_dbg ошибка: ' + (e.response?.status || '') + ' ' + (e.message || ''));
     }
@@ -1064,7 +1068,6 @@ bot.command('ws_recent', async (ctx) => {
       ctx.reply('Ошибка покупки.');
     }
   });
-
   // учёт ручной продажи (PAPER)
   bot.command('sold', async (ctx) => {
     const p = (ctx.match || '').trim().split(/\s+/);
@@ -1078,31 +1081,36 @@ bot.command('ws_recent', async (ctx) => {
     notify(`💰 Продажа (ручная) за ${price.toFixed(2)} $ (комиссия ${(price * CFG.FEE_RATE).toFixed(2)})\nБаланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`);
   });
 
-    // /hist <точное имя> [hours=168]
+  // новая /hist: показывает суммарные метрики и последнюю ленту цен
+  // /hist <точное имя> [last=8]
   bot.command('hist', async (ctx) => {
     try {
       const raw = (ctx.match || '').trim();
-      if (!raw) return ctx.reply('Использование: /hist <точное имя> [hours=168]');
-      let name = raw, hours = 168;
-      const m = raw.match(/\bhours=(\d+)\b/i);
-      if (m) { hours = Math.max(1, Math.min(168*4, parseInt(m[1],10))); name = raw.replace(/\s*\bhours=\d+\b\s*/i,'').trim(); }
-      const s = getPriceChange7d(name, hours);
+      if (!raw) return ctx.reply('Использование: /hist <точное имя> [last=8]');
+      let name = raw, lastN = CFG.SHOW_LAST_CHANGES;
+      const m = raw.match(/\blast=(\d+)\b/i);
+      if (m) { lastN = Math.max(1, Math.min(100, parseInt(m[1],10))); name = raw.replace(/\s*\blast=\d+\b\s*/i,'').trim(); }
       await waitForFresh(name);
       const min = getLiveMinOffer(name);
-      const now = min ? Number(min.price) : s.price_now;
+      const now = min ? Number(min.price) : NaN;
+
+      const series = getSeriesAll(name);
+      const stats = summaryStats(series);
+      const lane = series.slice(-lastN).map(x => Number(x.price.toFixed(4)));
+
       const lines = [
-        `⏱ Период: ~${hours} ч`,
-        `Текущая: $${(now??0).toFixed(2)}`,
-        `Изменение: ${(s.change_pct*100).toFixed(2)}% ($${(s.change_usd||0).toFixed(2)})`,
-        `Средняя: $${(s.mean_price||0).toFixed(2)} • Стд: $${(s.std_price||0).toFixed(2)}`,
-        `Точек наблюдений: ${s.sample_cnt||0}`
+        `Текущая: ${Number.isFinite(now)?'$'+now.toFixed(2): (series.length? '$'+series[series.length-1].price.toFixed(2) : '—')}`,
+        `Всего точек: ${stats.n}`,
+        `Изм. от первой точки: ${fmtPctSigned(stats.change_pct)} (${fmtUsdSigned(stats.change_abs)})`,
+        `Средняя: ${fmtUsd(stats.mean)} • Стд: ${fmtUsd(stats.std)} • CV: ${Number.isFinite(stats.cv)? stats.cv.toFixed(3) : '—'}`,
+        `Последние ${lane.length} цен: [${lane.join(', ')}]`
       ].join('\n');
+
       ctx.reply(`📈 ${name}\n` + lines);
     } catch (e) {
       ctx.reply('hist ошибка: ' + (e.message || e));
     }
   });
-
   // управление циклами и сокетами
   bot.command('ws_on', (ctx) => { startWs(); ctx.reply('WebSocket: ВКЛ'); });
   bot.command('ws_off', (ctx) => { stopWs(); ctx.reply('WebSocket: ВЫКЛ'); });
@@ -1113,8 +1121,7 @@ bot.command('ws_recent', async (ctx) => {
 
   bot.command('sig_on', (ctx) => { startSignalLoop(); ctx.reply('Сигналы TP/SL: ВКЛ'); });
   bot.command('sig_off', (ctx) => { stopSignalLoop(); ctx.reply('Сигналы TP/SL: ВЫКЛ'); });
-
-  // перезагрузка каталога
+ // перезагрузка каталога
   bot.command('catalog_reload', async (ctx) => {
     try {
       const info = await loadCsgoCatalog();
@@ -1165,12 +1172,10 @@ async function aiScanAndMaybeBuy() {
     if ((x.f.probUp || 0) < CFG.AI_MIN_PROB_UP) continue;
     if (!CFG.BUY_PARTNER || !CFG.BUY_TOKEN) { LOG.warn('Нет BUY_PARTNER/BUY_TOKEN — AI-покупка пропущена'); break; }
 
-    // Перед самой покупкой — ещё раз взять САМУЮ свежую цену
     await waitForFresh(x.it.name);
     const live = getLiveMinOffer(x.it.name);
     if (!live) continue;
     const it = { ...live };
-
     if (!isCs2Id(it.id)) continue;
 
     const cid = `ai-${Date.now()}-${it.id}`;
@@ -1207,7 +1212,7 @@ async function aiScanAndMaybeBuy() {
       `Потрачено: ${spent.toFixed(2)} $ (комиссия ${(spent * CFG.FEE_RATE).toFixed(2)})`,
       `Баланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`,
       `Прогноз: Δ3ч≈${fmtPctSigned(x.f.exp_up_pct_short)} (${fmtUsdSigned(x.f.exp_up_usd_short || 0)}), Δк продаже (после комиссий)≈${fmtPctSigned(x.netHoldPct)} (${fmtUsdSigned(x.netHoldUSD || 0)})`,
-      lines
+      `Лента: [${(x.lastChanges||[]).join(', ')}]`
     ].join('\n');
     notifyOnce(text, `buy:${payload?.purchase_id || it.id}`, 3600e3);
 
