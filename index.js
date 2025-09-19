@@ -61,8 +61,9 @@ const CFG = {
   LOG_JSON: (process.env.LOG_JSON || '1') === '1',
   LOG_LEVEL: (process.env.LOG_LEVEL || 'INFO').toUpperCase(),
 
-  // WebSocket
+  // WebSocket антифлуд (база) и «горячие» имена
   WS_SNAPSHOT_MIN_INTERVAL_SEC: Number(process.env.WS_SNAPSHOT_MIN_INTERVAL_SEC || 10),
+  HOT_NAME_SNAPSHOT_MS: Number(process.env.HOT_NAME_SNAPSHOT_MS || 2000),
 
   // «Свежесть»
   FRESH_WAIT_MS: Number(process.env.FRESH_WAIT_MS || 200),
@@ -78,8 +79,11 @@ const CFG = {
   // отображение «ленты цен» в ai_scan
   SHOW_LAST_CHANGES: Number(process.env.SHOW_LAST_CHANGES || 8),
 
-  // сравнение цен
+  // сравнение цен (EPS абсолютный); относительный EPS задаётся в коде (0.05%)
   PRICE_EPS: Number(process.env.PRICE_EPS || 0.0001),
+
+  // фоновый «пульс» по рынку
+  PULSE_EVERY_MS: Number(process.env.PULSE_EVERY_MS || 15000),
 
   // ранжирование, минимальный edge на удержание (после комиссий)
   MIN_EDGE_HOLD_PCT: Number(process.env.MIN_EDGE_HOLD_PCT || 0),
@@ -155,11 +159,21 @@ const setPaperBalance = (v) => db.prepare('UPDATE balance SET USD=? WHERE id=1')
 // helpers: история
 const selLastPrice = db.prepare('SELECT price FROM price_points WHERE skin_name=? ORDER BY ts DESC LIMIT 1');
 const insPoint = db.prepare('INSERT OR REPLACE INTO price_points (skin_name, skin_id, price, ts) VALUES (?,?,?,?)');
+
+// комбинированный критерий «цена изменилась»
+function priceChanged(prev, now, absEps = CFG.PRICE_EPS, relEps = 0.0005 /*=0.05%*/) {
+  const a = Number(prev), b = Number(now);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  if (Math.abs(a - b) > absEps) return true;
+  const base = Math.max(1e-9, Math.abs(a));
+  return Math.abs(a - b) / base > relEps;
+}
+
 function insertPointIfChanged({ skin_name, skin_id, price, ts }) {
   const last = selLastPrice.get(skin_name);
   const p = Number(price);
   if (!Number.isFinite(p)) return false;
-  if (last && Math.abs(Number(last.price) - p) <= CFG.PRICE_EPS) return false; // цены одинаковые — не пишем
+  if (last && !priceChanged(Number(last.price), p)) return false;
   insPoint.run(skin_name, skin_id ?? null, p, ts);
   return true;
 }
@@ -227,6 +241,9 @@ const catalogByName = new Map();  // name -> [ids]
 
 const snapGuard = new Map();
 
+// «горячие» имена — чаще разрешаем снапшоты
+const hotNames = new Set();
+
 // ——— отладка WS
 function pushWsDebug(kind, payload) {
   try {
@@ -247,10 +264,11 @@ function pushWsDebug(kind, payload) {
   } catch {}
 }
 
-function canSnapshot(name) {
+function canSnapshotFor(name) {
   const now = Date.now();
+  const minGap = hotNames.has(name) ? CFG.HOT_NAME_SNAPSHOT_MS : CFG.WS_SNAPSHOT_MIN_INTERVAL_SEC * 1000;
   const last = snapGuard.get(name) || 0;
-  if (now - last >= CFG.WS_SNAPSHOT_MIN_INTERVAL_SEC * 1000) {
+  if (now - last >= minGap) {
     snapGuard.set(name, now);
     if (snapGuard.size > 5000) {
       const cutoff = now - 3600e3;
@@ -299,8 +317,8 @@ function upsertOffer({ id, name, price, unlock_at, created_at }) {
   offersById.set(rec.id, enrichWithCatalog(rec));
   setMin(rec.name, rec.id, rec.price);
 
-  // история: пишем ТОЛЬКО ИЗМЕНЕНИЯ (EPS) и только когда прошёл антифлуд
-  if (canSnapshot(rec.name)) {
+  // история: пишем ТОЛЬКО ИЗМЕНЕНИЯ (EPS) и с учётом «горячести» имени
+  if (canSnapshotFor(rec.name)) {
     insertPointIfChanged({ skin_name: rec.name, skin_id: rec.id, price: rec.price, ts: nowIso });
   }
 }
@@ -466,7 +484,7 @@ function* iterateLiveMins() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// 7) История из БД / признаки / прогноз (теперь — по всей истории)
+// 7) История из БД / признаки / прогноз (по ВСЕЙ ИСТОРИИ)
 // ──────────────────────────────────────────────────────────────────────────────
 function getSeriesAll(name) {
   const rows = db.prepare(`SELECT price, ts FROM price_points WHERE skin_name=? ORDER BY ts ASC`).all(name);
@@ -522,7 +540,7 @@ function summaryStats(series) {
   return { n, change_pct, change_abs, mean, std, cv };
 }
 
-// Прогноз (LLM + эвристика) на основе ВСЕЙ ИСТОРИИ
+// Прогноз (LLM + эвристика)
 let _llmCallsThisScan = 0, _lastLLMCallAt = 0;
 const resetLLM = () => { _llmCallsThisScan = 0; };
 async function guardLLM() {
@@ -570,15 +588,12 @@ function jitterForecast(f) {
 }
 
 function heuristicForecast({ Hshort, Hhold_eff, priceUsd, sStats, prior_up, meta }) {
-  // масштаб горизонта (эффективная «весовая» длина)
   const horizK_hold  = Math.min(1, Hhold_eff / 168);
   const horizK_short = Math.min(1, Hshort     / 168);
 
-  // базовый тренд = изменение за всю историю
   let expH = sStats.change_pct * horizK_hold;
   let expS = sStats.change_pct * horizK_short;
 
-  // штрафы за волатильность и скудную выборку
   const volPenalty = Math.max(0, Math.min(0.4, 0.3 * (sStats.cv || 0)));
   const sampPenalty = (sStats.n < 6) ? 0.35 : 0;
 
@@ -604,14 +619,9 @@ function appendLivePoint(series, livePrice, eps = CFG.PRICE_EPS) {
   if (!Number.isFinite(livePrice)) return series;
   if (!series.length) return [{ ts: Date.now(), price: Number(livePrice) }];
   const last = series[series.length - 1];
-  if (Math.abs(last.price - livePrice) <= eps) {
-    // цена не изменилась — можно просто «освежить» метку времени,
-    // либо оставить как есть. Я оставляю как есть, чтобы не искажать длительность.
-    return series;
-  }
+  if (Math.abs(last.price - livePrice) <= eps) return series;
   return [...series, { ts: Date.now(), price: Number(livePrice) }];
 }
-
 
 function skinFeaturesFromLive(offer) {
   const now = Date.now();
@@ -619,9 +629,8 @@ function skinFeaturesFromLive(offer) {
   const unlock_at = offer.unlock_at ? Date.parse(offer.unlock_at) : NaN;
   const unlockH = Number.isFinite(unlock_at) && unlock_at > now ? Math.ceil((unlock_at - now)/3600e3) : 0;
 
-  // вся история из БД
   let rawSeries = getSeriesAll(offer.name);
-  // ВАЖНО: доклеиваем свежий тик из WS только для LLM/аналитики
+  // доклеиваем свежий тик из WS только для анализа/LLM
   rawSeries = appendLivePoint(rawSeries, Number(offer.price));
 
   const sStats = summaryStats(rawSeries);
@@ -635,7 +644,6 @@ function skinFeaturesFromLive(offer) {
     stats: sStats
   };
 }
-
 
 async function forecastDirection({ skinName, features, allowLLM = true }) {
   const holdHours = (features?.hold_days_after_buy ?? CFG.HOLD_DAYS) * 24;
@@ -655,7 +663,7 @@ async function forecastDirection({ skinName, features, allowLLM = true }) {
     series_len: sStats.n, cv: sStats.cv, change_pct_total: sStats.change_pct, mean: sStats.mean, std: sStats.std
   };
 
-  // кэш
+  // кэш/режимы
   const cached = getCachedForecast(skinName, priceUsd, Hhold_eff, prior_up);
   if (!CFG.OPENAI_API_KEY || CFG.AI_LLM_MODE === 'off') {
     const out = heuristicForecast({ Hshort, Hhold_eff, priceUsd, sStats, prior_up, meta });
@@ -772,6 +780,10 @@ async function aiRankFromLive({ price_from, price_to, only_unlocked, limit }) {
         : (CFG.AI_LLM_MODE === 'auto') ? CFG.AI_OPENAI_MAX_CALLS_PER_SCAN : 0;
   const mark = new Set(preCapped.slice(0, K).map(x => x.off.name));
 
+  // «подогреваем» имена, попавшие в топ выборки
+  hotNames.clear();
+  for (const row of preCapped) hotNames.add(row.off.name);
+
   const scored = [];
   for (const row of preCapped) {
     await waitForFresh(row.off.name);
@@ -815,6 +827,7 @@ function trackSkinForSignals(name, entry, unlockHours = 0) {
   const tp = entry * (1 + CFG.TP_PCT), sl = entry * (1 - CFG.SL_PCT);
   const not_before = Date.now() + unlockHours * 3600e3 + CFG.HOLD_DAYS * 86400e3;
   watchMap.set(name, { entry, tp, sl, last: entry, not_before });
+  hotNames.add(name); // сделать имя «горячим» для более частого логгирования истории
   LOG.info('Track', { name, entry, tp, sl, not_before });
 }
 async function refreshSignals() {
@@ -886,7 +899,6 @@ async function sendLongHtml(ctx, html) {
   flush();
   for (let i=0;i<chunks.length;i++){
     const suffix = chunks.length>1 ? `\n\n— страница ${i+1}/${chunks.length}` : '';
-    // eslint-disable-next-line no-await-in-loop
     await ctx.reply(chunks[i]+suffix, { parse_mode:'HTML', disable_web_page_preview:true });
   }
 }
@@ -899,7 +911,6 @@ function formatScanMessage(ranked) {
     const dS = fmtPctSigned(x.f.exp_up_pct_short), uS = fmtUsdSigned(x.f.exp_up_usd_short||0);
     const dH = fmtPctSigned(x.netHoldPct);  const uH = fmtUsdSigned(x.netHoldUSD || 0);
     const hh = x.f?.horizons?.hold_h ?? (CFG.HOLD_DAYS*24);
-    // новая «лента изменений»
     const lane = (x.lastChanges || []).length ? `[${x.lastChanges.map(n=>Number(n.toFixed ? n.toFixed(2) : n).toString()).join(', ')}]` : '—';
     const emoji = x.netHoldPct>0?'🟢':(x.netHoldPct<0?'🔴':'⚪️');
     return `${emoji} <b>${i+1}. ${name}</b>
@@ -911,7 +922,51 @@ function formatScanMessage(ranked) {
   return `🔎 <b>Топ кандидаты</b>\n\n` + rows.join('\n\n');
 }
 
-// Команды
+// ──────────────────────────────────────────────────────────────────────────────
+// 10.1) Ре-гидрейт истории из WS-буфера и «пульс» по рынку
+// ──────────────────────────────────────────────────────────────────────────────
+function backfillFromWsBuffer(limitPerName = 20) {
+  const perName = new Map();
+  let inserted = 0;
+  for (let i = wsBuf.length - 1; i >= 0; i--) {
+    const r = wsBuf[i];
+    if (!r || !r.name || !Number.isFinite(Number(r.price)) || !isCs2Id(r.id)) continue;
+    const cnt = perName.get(r.name) || 0;
+    if (cnt >= limitPerName) continue;
+    const ts = r.t || new Date().toISOString();
+    if (insertPointIfChanged({ skin_name: r.name, skin_id: r.id, price: Number(r.price), ts })) {
+      perName.set(r.name, cnt + 1);
+      inserted++;
+    }
+  }
+  LOG.info('Backfill from WS buffer done', { inserted, names: perName.size });
+  return { inserted, names: perName.size };
+}
+
+let pulseTimer = null;
+function startPulse(intervalMs = CFG.PULSE_EVERY_MS) {
+  if (pulseTimer) return;
+  pulseTimer = setInterval(() => {
+    const nowIso = new Date().toISOString();
+    let writes = 0;
+    for (const off of iterateLiveMins()) {
+      if (insertPointIfChanged({ skin_name: off.name, skin_id: off.id, price: off.price, ts: nowIso })) {
+        writes++;
+      }
+    }
+    if (writes) LOG.debug('Pulse wrote points', { writes });
+  }, Math.max(1000, Number(intervalMs)||15000));
+  LOG.info('Pulse ON', { every_ms: intervalMs });
+}
+function stopPulse() {
+  if (!pulseTimer) return;
+  clearInterval(pulseTimer); pulseTimer = null;
+  LOG.info('Pulse OFF');
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 10.2) Команды Telegram
+// ──────────────────────────────────────────────────────────────────────────────
 const botReady = !!bot;
 if (botReady) {
   bot.catch(e => LOG.error('Telegram error', { msg: e.message }));
@@ -989,7 +1044,7 @@ if (botReady) {
     }
   });
 
-  // отладочный ai_scan (с JSON)
+   // отладочный ai_scan (с JSON)
   bot.command('ai_scan_dbg', async (ctx) => {
     try {
       const kv = {}; const raw = (ctx.match ?? '').trim();
@@ -1071,7 +1126,7 @@ if (botReady) {
     }
   });
 
-  // учёт ручной продажи (PAPER)
+   // учёт ручной продажи (PAPER)
   bot.command('sold', async (ctx) => {
     const p = (ctx.match || '').trim().split(/\s+/);
     if (!p[0]) return ctx.reply('Использование: /sold <цена> [название]');
@@ -1084,7 +1139,7 @@ if (botReady) {
     notify(`💰 Продажа (ручная) за ${price.toFixed(2)} $ (комиссия ${(price * CFG.FEE_RATE).toFixed(2)})\nБаланс: ${Number.isNaN(bal) ? '—' : bal.toFixed(2) + ' $'}`);
   });
 
-  // новая /hist: показывает суммарные метрики и последнюю ленту цен
+  // новая /hist: суммарные метрики и последняя лента цен
   // /hist <точное имя> [last=8]
   bot.command('hist', async (ctx) => {
     try {
@@ -1115,7 +1170,7 @@ if (botReady) {
     }
   });
 
-  // управление циклами и сокетами
+    // управление циклами и сокетами
   bot.command('ws_on', (ctx) => { startWs(); ctx.reply('WebSocket: ВКЛ'); });
   bot.command('ws_off', (ctx) => { stopWs(); ctx.reply('WebSocket: ВЫКЛ'); });
 
@@ -1134,6 +1189,16 @@ if (botReady) {
     } catch (e) {
       ctx.reply(`catalog_reload ошибка: ${e.message || e}`);
     }
+  });
+
+  // управление пульсом и быстрым бэκфиллом
+  bot.command('pulse_on', (ctx) => { startPulse(); ctx.reply(`Pulse: ВКЛ (${CFG.PULSE_EVERY_MS} мс)`); });
+  bot.command('pulse_off', (ctx) => { stopPulse(); ctx.reply('Pulse: ВЫКЛ'); });
+  bot.command('backfill', (ctx) => {
+    const raw = (ctx.match || '').trim();
+    const n = Math.max(1, Math.min(200, Number(raw)||20));
+    const { inserted, names } = backfillFromWsBuffer(n);
+    ctx.reply(`Backfill: вставлено точек ${inserted}, затронуто имён ${names}`);
   });
 
   bot.start().then(() => LOG.info('Telegram-бот запущен'));
@@ -1237,6 +1302,7 @@ async function aiScanAndMaybeBuy() {
 function mainLoops() {
   startWs();
   startSignalLoop();
+  startPulse(CFG.PULSE_EVERY_MS); // лёгкий сбор истории по изменению цен
   if (Number(CFG.AI_AUTO_BUY) === 1) startAiLoop();
 }
 
@@ -1248,11 +1314,14 @@ async function main() {
     LOG.warn('Каталог не загружен', { msg: e.message });
   }
   mainLoops();
+  // быстрый бэκфилл истории из уже накопленного ws-буфера (чуть позже старта)
+  setTimeout(() => backfillFromWsBuffer(50), 2000);
 }
 
 function shutdown(code = 0) {
   try { stopAiLoop(); } catch {}
   try { stopSignalLoop(); } catch {}
+  try { stopPulse(); } catch {}
   try { stopWs(); } catch {}
   try { if (bot) bot.stop(); } catch {}
   try { db.close(); } catch {}
@@ -1272,5 +1341,7 @@ if (require.main === module) {
 module.exports = {
   CFG, IS_LIVE, db, lis,
   aiRankFromLive, aiScanAndMaybeBuy, trackSkinForSignals,
-  startWs, stopWs, loadCsgoCatalog
+  startWs, stopWs, loadCsgoCatalog,
+  backfillFromWsBuffer, startPulse, stopPulse
 };
+
