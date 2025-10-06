@@ -2,7 +2,7 @@
 import { LOG } from './logger.js';
 import { CFG } from './config.js';
 import { startLisWs, stopLisWs } from './lis.js';
-import { startCsMoneyLoop, stopCsMoneyLoop } from './csm.js';   // без auth-лупа
+import { startCsMoneyLoop, stopCsMoneyLoop } from './csmoney.js';   // без auth-лупа
 import { startTelegram, stopTelegram } from './telegram.js';
 
 process.title = 'skins-arb-bot';
