@@ -1,34 +1,66 @@
+// file: src/index.js
 import { LOG } from './logger.js';
-import { startLisWs, stopLisWs } from './lis.js';
-import { startCsMoneyLoop, stopCsMoneyLoop, startCsMoneyAuthLoop } from './csmoney.js';
-import { startTelegram, stopTelegram } from './telegram.js';
 import { CFG } from './config.js';
+import { startLisWs, stopLisWs } from './lis.js';
+import { startCsMoneyLoop, stopCsMoneyLoop } from './csm.js';   // без auth-лупа
+import { startTelegram, stopTelegram } from './telegram.js';
 
-async function main() {
-  LOG.info('Skins Arb Bot starting...', { mode: 'LIVE', hold_days: CFG.TRADE_HOLD_DAYS });
+process.title = 'skins-arb-bot';
 
-  // LIS WebSocket → live_min + снапшоты
+let shuttingDown = false;
+
+function onUnhandled(reason, p) {
+  try {
+    LOG.error('Unhandled rejection', { reason: reason?.stack || String(reason) });
+  } catch {}
+}
+function onUncaught(err) {
+  try {
+    LOG.error('Uncaught exception', { msg: err?.message, stack: err?.stack });
+  } catch {}
+  // не падаем мгновенно — дадим shutdown отработать
+  shutdown(1);
+}
+
+process.on('unhandledRejection', onUnhandled);
+process.on('uncaughtException', onUncaught);
+
+async function bootstrap() {
+  LOG.info('Skins Arb Bot starting...', {
+    mode: 'LIVE',
+    hold_days: CFG.TRADE_HOLD_DAYS,
+  });
+
+  // 1) Liskins WS → агрегируем live_min и снапшоты
   await startLisWs();
 
-  startCsMoneyAuthLoop();  // периодический рефреш кук
-  startCsMoneyLoop();      // сканер CS.MONEY
+  // 2) CS.MONEY публичный сканер (без авторизации)
+  startCsMoneyLoop();
 
-  // Telegram (сигналы/команды)
+  // 3) Telegram команды/сигналы
   startTelegram();
 
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  // Грейсфул стоп
+  process.once('SIGINT', () => shutdown(0));
+  process.once('SIGTERM', () => shutdown(0));
 }
 
-function shutdown() {
-  try { stopLisWs(); } catch {}
-  try { stopCsMoneyLoop(); } catch {}
+async function shutdown(code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  LOG.info('Skins Arb Bot stopping...');
+
   try { stopTelegram(); } catch {}
+  try { stopCsMoneyLoop(); } catch {}
+  try { stopLisWs(); } catch {}
+
   LOG.info('Skins Arb Bot stopped');
-  process.exit(0);
+  // небольшая задержка, чтобы логи успели уйти
+  setTimeout(() => process.exit(code), 100);
 }
 
-main().catch(e => {
-  LOG.error('Fatal start error', { msg: e.message });
+bootstrap().catch((e) => {
+  LOG.error('Fatal start error', { msg: e?.message, stack: e?.stack });
+  // сообщаем pm2 об ошибке
   process.exit(1);
 });
