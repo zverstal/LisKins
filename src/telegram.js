@@ -3,7 +3,10 @@ import { CFG } from './config.js';
 import { LOG } from './logger.js';
 import { getLivePair } from './db.js';
 import { findArbCandidates } from './scan.js';
-import { forecastCrossAfterLock, getForecast } from './forecaster.js';
+import { forecastCrossAfterLock } from './forecaster.js';
+import { getForecast } from './db.js';
+
+
 
 let bot = null;
 
