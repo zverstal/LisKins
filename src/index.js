@@ -1,6 +1,6 @@
 import { LOG } from './logger.js';
 import { startLisWs, stopLisWs } from './lis.js';
-import { startCsMoneyLoop, stopCsMoneyLoop } from './csmoney.js';
+import { startCsMoneyLoop, stopCsMoneyLoop, startCsMoneyAuthLoop } from './csmoney.js';
 import { startTelegram, stopTelegram } from './telegram.js';
 import { CFG } from './config.js';
 
@@ -10,8 +10,8 @@ async function main() {
   // LIS WebSocket → live_min + снапшоты
   await startLisWs();
 
-  // CSMONEY loop → poll публичную витрину батчами
-  startCsMoneyLoop();
+  startCsMoneyAuthLoop();  // периодический рефреш кук
+  startCsMoneyLoop();      // сканер CS.MONEY
 
   // Telegram (сигналы/команды)
   startTelegram();

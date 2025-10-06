@@ -1,11 +1,174 @@
+// file: src/csm.js
+// Единственный модуль для CS.MONEY: авторизация + куки + запросы + сканер.
+// ----------------------------------------------------------------------------
+// .env (пример):
+//   CSM_LOGIN_URL="https://cs.money/login?token=...&redirectUrl=https://cs.money/ru/"
+//   CSM_STEAM_COOKIE="sessionid=...; steamLoginSecure=...; steamCountry=...; timezoneOffset=...,0; browserid=..."
+//   CSM_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+//   CSM_COOKIE_FILE="data/csm_cookies.json"
+//   CSM_REFRESH_MINUTES=55
+//   CSM_CHROME_USER_DATA_DIR="data/chrome_profile"
+//   CSM_PROXY="http://user:pass@host:port"      # опционально
+//   CSM_SCAN_INTERVAL_MS=30000
+//   CSM_MIN_PRICE=0
+//   CSM_MAX_PRICE=300
+//   CSM_SCAN_STEP_USD=50
+//   CSM_SCAN_CONCURRENCY=3
+// ----------------------------------------------------------------------------
+
+import fs from 'fs';
+import path from 'path';
 import axios from 'axios';
 import PQueue from 'p-queue';
 import randomUA from 'random-useragent';
+import puppeteer from 'puppeteer';
+import puppeteerExtra from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { CFG } from './config.js';
 import { LOG } from './logger.js';
 import { upsertLiveMin } from './db.js';
 
-function headers() {
+puppeteerExtra.use(StealthPlugin());
+
+// -------------------------- Локальное хранилище кук --------------------------
+function ensureDir(p) { try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {} }
+
+function loadCookies(file) {
+  try { const raw = fs.readFileSync(file, 'utf8'); const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : []; }
+  catch { return []; }
+}
+function saveCookies(file, cookies) {
+  ensureDir(file);
+  fs.writeFileSync(file, JSON.stringify(cookies, null, 2), 'utf8');
+}
+function cookieHeaderFromJar(cookies, domainPart = 'cs.money') {
+  const now = Date.now() / 1000;
+  const pairs = cookies
+    .filter(c => !c.expirationDate || c.expirationDate > now)
+    .filter(c => (c.domain || '').includes(domainPart))
+    .map(c => `${c.name}=${c.value}`);
+  return pairs.join('; ');
+}
+
+// -------------------------- Авторизация / рефреш кук -------------------------
+let _refreshing = false;
+
+async function refreshCsMoneyCookies(reason = 'scheduled') {
+  if (_refreshing) return false;
+  _refreshing = true;
+
+  const start = Date.now();
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--lang=ru-RU,ru',
+  ];
+  if (CFG.CSM_PROXY) launchArgs.push(`--proxy-server=${CFG.CSM_PROXY}`);
+
+  const browser = await puppeteerExtra.launch({
+    headless: 'new',
+    args: launchArgs,
+    userDataDir: CFG.CSM_CHROME_USER_DATA_DIR || undefined,
+    defaultViewport: { width: 1366, height: 900 }
+  });
+
+  try {
+    const page = await browser.newPage();
+    if (CFG.CSM_USER_AGENT) await page.setUserAgent(CFG.CSM_USER_AGENT);
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+      'Upgrade-Insecure-Requests': '1',
+    });
+
+    // Если заданы куки Steam — подставим их в браузер, чтобы OpenID прошёл без логина:
+    if (CFG.CSM_STEAM_COOKIE) {
+      const steamPairs = CFG.CSM_STEAM_COOKIE.split(';').map(s => s.trim()).filter(Boolean);
+      const steamCookies = steamPairs.map(p => {
+        const i = p.indexOf('=');
+        if (i < 0) return null;
+        const name = p.slice(0, i).trim();
+        const value = p.slice(i + 1).trim();
+        return { name, value, domain: 'steamcommunity.com', path: '/', httpOnly: false, secure: true };
+      }).filter(Boolean);
+      if (steamCookies.length) {
+        await page.setCookie(...steamCookies);
+        LOG.info('CSM auth: steam cookies injected', { count: steamCookies.length });
+      }
+    }
+
+    // Запускаем SSO: идём на auth.dota.trade, он пошлёт на Steam OpenID, затем вернёт на cs.money/login
+    const ssoEntry = 'https://auth.dota.trade/login?redirectUrl=https://cs.money/ru/&callbackUrl=https://cs.money/login';
+    LOG.info('CSM auth: open SSO entry', { url: ssoEntry, reason });
+
+    // 1) заход на auth.dota.trade
+    await page.goto(ssoEntry, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // 2) редирект на steamcommunity openid: подождём навигацию
+    try { await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+
+    // Если мы на Steam — форма отправится сама/или нажмётся кнопка «Sign in»; подождём коллбек
+    // 3) ждём возврат на auth.dota.trade/login/callback
+    try { await page.waitForResponse(res => res.url().includes('auth.dota.trade/login/callback'), { timeout: 60000 }); }
+    catch {}
+
+    // 4) редирект на cs.money/login?token=... → затем на cs.money/ru/
+    try { await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }); } catch {}
+
+    // CF может показать «Just a moment…». Дождёмся первого успешного XHR sell-orders:
+    try {
+      await page.waitForResponse(
+        (res) => res.url().includes('/1.0/market/sell-orders') && res.status() === 200,
+        { timeout: 60000 }
+      );
+    } catch {
+      // запасной таймаут
+      await page.waitForTimeout(8000);
+    }
+
+    // Сохраняем куки по домену cs.money
+    const cookies = await page.cookies();
+    saveCookies(CFG.CSM_COOKIE_FILE, cookies);
+    const csCnt = cookies.filter(c => (c.domain || '').includes('cs.money')).length;
+
+    LOG.info('CSM auth: cookies saved', { cs_money_cookies: csCnt, ms: Date.now() - start });
+    return csCnt > 0;
+  } catch (e) {
+    LOG.warn('CSM auth failed', { msg: e.message });
+    return false;
+  } finally {
+    _refreshing = false;
+    await browser.close().catch(() => {});
+  }
+}
+
+let _authTimer = null;
+export function startCsMoneyAuthLoop() {
+  if (_authTimer) return;
+  const minutes = Math.max(15, Number(CFG.CSM_REFRESH_MINUTES || 55));
+
+  const run = async () => { await refreshCsMoneyCookies('scheduled'); };
+
+  // Если нет куков — авторизуемся сразу
+  const existing = loadCookies(CFG.CSM_COOKIE_FILE);
+  if (!existing.length) run(); else LOG.info('CSM auth: existing cookies found', { count: existing.length });
+
+  _authTimer = setInterval(run, minutes * 60 * 1000);
+  LOG.info('CSM auth loop ON', { every_min: minutes });
+}
+export function stopCsMoneyAuthLoop() {
+  if (!_authTimer) return;
+  clearInterval(_authTimer);
+  _authTimer = null;
+  LOG.info('CSM auth loop OFF');
+}
+
+// -------------------------- HTTP слой с авторековери -------------------------
+function buildHeaders() {
+  const jar = loadCookies(CFG.CSM_COOKIE_FILE);
+  const cookieHeader = cookieHeaderFromJar(jar, 'cs.money');
+
   return {
     'accept': 'application/json, text/plain, */*',
     'referer': 'https://cs.money/market/buy/',
@@ -13,28 +176,42 @@ function headers() {
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'x-client-app': 'web_mobile',
-    'accept-language': 'en-US,en;q=0.9',
-    'user-agent': CFG.CSM_USER_AGENT || randomUA.getRandom()
+    'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+    'user-agent': CFG.CSM_USER_AGENT || randomUA.getRandom(),
+    ...(cookieHeader ? { 'cookie': cookieHeader } : {})
   };
 }
 
-function axiosConfig() {
-  const cfg = {
-    timeout: 15000,
-    headers: headers(),
-    validateStatus: s => s === 200
-  };
-  if (CFG.CSM_PROXY_URL) {
-    // axios поддерживает http/httpsProxyAgent в конфиге через transport - но для простоты опустим здесь,
-    // можно использовать global-agent или undici.Agent при желании.
+async function httpGet(url, config) {
+  const doReq = async () => axios.get(url, {
+    timeout: 20000,
+    headers: buildHeaders(),
+    validateStatus: () => true,
+    ...(config || {})
+  });
+
+  let res = await doReq();
+
+  const looksLikeCF = (r) =>
+    r.status === 403 ||
+    (typeof r.data === 'string' && /Just a moment/i.test(r.data));
+
+  if (looksLikeCF(res)) {
+    LOG.warn('CSM 403/CF detected → refresh cookies…');
+    const ok = await refreshCsMoneyCookies('403-retry');
+    if (ok) res = await doReq();
   }
-  return cfg;
+
+  if (res.status !== 200) {
+    const body = (typeof res.data === 'string') ? res.data.slice(0, 200) : '';
+    throw new Error(`Request failed ${res.status}: ${body}`);
+  }
+  return res;
 }
 
-/** читаем страницу витрины (60 штук) в диапазоне цен */
+// ------------------------------ Сканер витрины -------------------------------
 async function fetchSellOrders({ offset = 0, minPrice = 0, maxPrice = 0, sort = 'discount', order = 'desc' } = {}) {
-  const res = await axios.get('https://cs.money/1.0/market/sell-orders', {
-    ...axiosConfig(),
+  const res = await httpGet('https://cs.money/1.0/market/sell-orders', {
     params: { limit: 60, offset, sort, order, minPrice, maxPrice }
   });
   const items = Array.isArray(res.data?.items) ? res.data.items : [];
@@ -42,35 +219,32 @@ async function fetchSellOrders({ offset = 0, minPrice = 0, maxPrice = 0, sort = 
     name: it?.asset?.names?.full || '',
     price: Number(it?.pricing?.computed || 0),
     img: it?.asset?.images?.steam || null,
-    // явного флага "locked" в этом ответе может не быть — считаем всё как доступное "к покупке",
-    // трейдлок/вывод на аккаунт пользователя всё равно регулируется Steam (TRADE_HOLD_DAYS).
+    // в этом эндпоинте флага locked нет — считаем false,
+    // держим в уме, что реальный трейдлок — политика Steam.
     locked: false,
     source_id: it?.id ? String(it.id) : null
   }));
 }
 
-/** полный проход по диапазону цен батчами (без offset>5000) */
 export async function scanCsMoneyOnce() {
-  const min = Math.max(0, CFG.CSM_MIN_PRICE);
-  const max = Math.max(min, CFG.CSM_MAX_PRICE);
-  const step = Math.max(5, CFG.CSM_SCAN_STEP_USD);
+  const min = Math.max(0, Number(CFG.CSM_MIN_PRICE || 0));
+  const max = Math.max(min, Number(CFG.CSM_MAX_PRICE || 300));
+  const step = Math.max(5, Number(CFG.CSM_SCAN_STEP_USD || 50));
 
   const ranges = [];
-  for (let a = min; a < max; a += step) {
-    ranges.push([a, Math.min(max, a + step)]);
-  }
+  for (let a = min; a < max; a += step) ranges.push([a, Math.min(max, a + step)]);
 
-  const queue = new PQueue({ concurrency: CFG.CSM_SCAN_CONCURRENCY });
+  const queue = new PQueue({ concurrency: Number(CFG.CSM_SCAN_CONCURRENCY || 3) });
   let totalItems = 0;
 
   await Promise.all(ranges.map(([a, b]) => queue.add(async () => {
-    // Внутри диапазона: 0..N страниц по 60, пока возвращают данные.
     let offset = 0;
     const limit = 60;
-    for (let page = 0; page < 200; page++) { // верхний "плавник" — не уйти в бесконечность
+    for (let page = 0; page < 200; page++) {
       const list = await fetchSellOrders({ offset, minPrice: a, maxPrice: b });
       if (!list.length) break;
       totalItems += list.length;
+
       for (const it of list) {
         if (!it.name || !Number.isFinite(it.price)) continue;
         upsertLiveMin({
@@ -82,6 +256,7 @@ export async function scanCsMoneyOnce() {
           unlock_at: null
         });
       }
+
       if (list.length < limit) break;
       offset += limit;
     }
@@ -91,23 +266,20 @@ export async function scanCsMoneyOnce() {
   LOG.info('CS.MONEY scan finished', { totalItems, ranges: ranges.length });
 }
 
-let timer = null;
+let _scanTimer = null;
 export function startCsMoneyLoop() {
-  if (timer) return;
+  if (_scanTimer) return;
   const loop = async () => {
-    try {
-      await scanCsMoneyOnce();
-    } catch (e) {
-      LOG.warn('CSM scan error', { msg: e.message });
-    }
+    try { await scanCsMoneyOnce(); }
+    catch (e) { LOG.warn('CSM scan error', { msg: e.message }); }
   };
-  loop(); // сразу
-  timer = setInterval(loop, Math.max(5000, CFG.CSM_SCAN_INTERVAL_MS));
-  LOG.info('CS.MONEY loop ON', { every_ms: CFG.CSM_SCAN_INTERVAL_MS });
+  loop(); // стартуем сразу
+  _scanTimer = setInterval(loop, Math.max(5000, Number(CFG.CSM_SCAN_INTERVAL_MS || 30000)));
+  LOG.info('CS.MONEY loop ON', { every_ms: Number(CFG.CSM_SCAN_INTERVAL_MS || 30000) });
 }
 export function stopCsMoneyLoop() {
-  if (!timer) return;
-  clearInterval(timer);
-  timer = null;
+  if (!_scanTimer) return;
+  clearInterval(_scanTimer);
+  _scanTimer = null;
   LOG.info('CS.MONEY loop OFF');
 }
