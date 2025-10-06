@@ -341,4 +341,3 @@ export function stopCsMoneyLoop() {
   _scanTimer = null;
   LOG.info('CS.MONEY loop OFF');
 }
-а
