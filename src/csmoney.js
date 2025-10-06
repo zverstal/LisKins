@@ -8,7 +8,8 @@
 //   CSM_COOKIE_FILE="data/csm_cookies.json"
 //   CSM_REFRESH_MINUTES=55
 //   CSM_CHROME_USER_DATA_DIR="data/chrome_profile"
-//   CSM_PROXY="http://user:pass@host:port"      # опционально
+//   CSM_CHROME_EXECUTABLE="/usr/bin/chromium-browser"     # или /usr/bin/chromium
+//   CSM_PROXY="http://user:pass@host:port"                # опционально (Basic auth поддерживается)
 //   CSM_SCAN_INTERVAL_MS=30000
 //   CSM_MIN_PRICE=0
 //   CSM_MAX_PRICE=300
@@ -21,7 +22,6 @@ import path from 'path';
 import axios from 'axios';
 import PQueue from 'p-queue';
 import randomUA from 'random-useragent';
-import puppeteer from 'puppeteer';
 import puppeteerExtra from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { CFG } from './config.js';
@@ -30,27 +30,71 @@ import { upsertLiveMin } from './db.js';
 
 puppeteerExtra.use(StealthPlugin());
 
-// -------------------------- Локальное хранилище кук --------------------------
-function ensureDir(p) { try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {} }
+// -----------------------------------------------------------------------------
+// utils
+// -----------------------------------------------------------------------------
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+function ensureDir(p) {
+  try { fs.mkdirSync(path.dirname(p), { recursive: true }); } catch {}
+}
 
 function loadCookies(file) {
-  try { const raw = fs.readFileSync(file, 'utf8'); const arr = JSON.parse(raw); return Array.isArray(arr) ? arr : []; }
-  catch { return []; }
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
 }
+
 function saveCookies(file, cookies) {
   ensureDir(file);
   fs.writeFileSync(file, JSON.stringify(cookies, null, 2), 'utf8');
 }
+
 function cookieHeaderFromJar(cookies, domainPart = 'cs.money') {
   const now = Date.now() / 1000;
   const pairs = cookies
-    .filter(c => !c.expirationDate || c.expirationDate > now)
-    .filter(c => (c.domain || '').includes(domainPart))
-    .map(c => `${c.name}=${c.value}`);
+    .filter((c) => !c.expirationDate || c.expirationDate > now)
+    .filter((c) => (c.domain || '').includes(domainPart))
+    .map((c) => `${c.name}=${c.value}`);
   return pairs.join('; ');
 }
 
-// -------------------------- Авторизация / рефреш кук -------------------------
+function parseProxyAuth(proxyUrl) {
+  try {
+    const u = new URL(proxyUrl);
+    const hasAuth = u.username || u.password;
+    return hasAuth ? { username: decodeURIComponent(u.username), password: decodeURIComponent(u.password) } : null;
+  } catch { return null; }
+}
+
+function makeSteamCookiesFromEnv(str) {
+  if (!str) return [];
+  return str
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((p) => {
+      const i = p.indexOf('=');
+      if (i < 0) return null;
+      const name = p.slice(0, i).trim();
+      const value = p.slice(i + 1).trim();
+      // кладём на оба домена, чтобы наверняка
+      return [
+        { name, value, domain: 'steamcommunity.com', path: '/', httpOnly: false, secure: true },
+        { name, value, domain: '.steamcommunity.com', path: '/', httpOnly: false, secure: true },
+      ];
+    })
+    .filter(Boolean)
+    .flat();
+}
+
+// -----------------------------------------------------------------------------
+// Авторизация / рефреш куков CS.MONEY
+// -----------------------------------------------------------------------------
 let _refreshing = false;
 
 async function refreshCsMoneyCookies(reason = 'scheduled') {
@@ -71,66 +115,71 @@ async function refreshCsMoneyCookies(reason = 'scheduled') {
     headless: 'new',
     args: launchArgs,
     userDataDir: CFG.CSM_CHROME_USER_DATA_DIR || undefined,
-    defaultViewport: { width: 1366, height: 900 }
+    executablePath: CFG.CSM_CHROME_EXECUTABLE || undefined,
+    defaultViewport: { width: 1366, height: 900 },
   });
 
   try {
     const page = await browser.newPage();
+
+    // если прокси с basic auth
+    const auth = CFG.CSM_PROXY ? parseProxyAuth(CFG.CSM_PROXY) : null;
+    if (auth) await page.authenticate(auth);
+
     if (CFG.CSM_USER_AGENT) await page.setUserAgent(CFG.CSM_USER_AGENT);
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
       'Upgrade-Insecure-Requests': '1',
     });
 
-    // Если заданы куки Steam — подставим их в браузер, чтобы OpenID прошёл без логина:
-    if (CFG.CSM_STEAM_COOKIE) {
-      const steamPairs = CFG.CSM_STEAM_COOKIE.split(';').map(s => s.trim()).filter(Boolean);
-      const steamCookies = steamPairs.map(p => {
-        const i = p.indexOf('=');
-        if (i < 0) return null;
-        const name = p.slice(0, i).trim();
-        const value = p.slice(i + 1).trim();
-        return { name, value, domain: 'steamcommunity.com', path: '/', httpOnly: false, secure: true };
-      }).filter(Boolean);
-      if (steamCookies.length) {
-        await page.setCookie(...steamCookies);
-        LOG.info('CSM auth: steam cookies injected', { count: steamCookies.length });
-      }
+    // Инъекция steam cookies — чтобы OpenID прошёл руками без логина
+    const steamCookies = makeSteamCookiesFromEnv(CFG.CSM_STEAM_COOKIE);
+    if (steamCookies.length) {
+      await page.setCookie(...steamCookies);
+      LOG.info('CSM auth: steam cookies injected', { count: steamCookies.length });
     }
 
-    // Запускаем SSO: идём на auth.dota.trade, он пошлёт на Steam OpenID, затем вернёт на cs.money/login
-    const ssoEntry = 'https://auth.dota.trade/login?redirectUrl=https://cs.money/ru/&callbackUrl=https://cs.money/login';
+    // SSO цепочка: auth.dota.trade -> steam openid -> cs.money/login -> cs.money/ru/
+    const ssoEntry = CFG.CSM_LOGIN_URL?.trim() ||
+      'https://auth.dota.trade/login?redirectUrl=https://cs.money/ru/&callbackUrl=https://cs.money/login';
+
     LOG.info('CSM auth: open SSO entry', { url: ssoEntry, reason });
 
-    // 1) заход на auth.dota.trade
+    // 1) заходим на точку входа
     await page.goto(ssoEntry, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // 2) редирект на steamcommunity openid: подождём навигацию
-    try { await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch {}
+    // 2) возможный редирект на Steam OpenID
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 
-    // Если мы на Steam — форма отправится сама/или нажмётся кнопка «Sign in»; подождём коллбек
-    // 3) ждём возврат на auth.dota.trade/login/callback
-    try { await page.waitForResponse(res => res.url().includes('auth.dota.trade/login/callback'), { timeout: 60000 }); }
-    catch {}
+    // 3) ждём callback auth.dota.trade
+    await page.waitForResponse((res) => res.url().includes('auth.dota.trade/login/callback'), { timeout: 60000 }).catch(() => {});
 
-    // 4) редирект на cs.money/login?token=... → затем на cs.money/ru/
-    try { await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }); } catch {}
+    // 4) редирект на cs.money/login -> cs.money/ru
+    await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
 
-    // CF может показать «Just a moment…». Дождёмся первого успешного XHR sell-orders:
+    // Прогрев CS.MONEY чтобы Cloudflare отдал валидацию JS
     try {
-      await page.waitForResponse(
-        (res) => res.url().includes('/1.0/market/sell-orders') && res.status() === 200,
-        { timeout: 60000 }
-      );
-    } catch {
-      // запасной таймаут
-      await page.waitForTimeout(8000);
-    }
+      // главная
+      await page.goto('https://cs.money/ru/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // ждём, пока заголовок перестанет быть "Just a moment"
+      await page.waitForFunction(() => !/Just a moment/i.test(document.title), { timeout: 60000 }).catch(() => {});
+      // витрина
+      await page.goto('https://cs.money/market/buy/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // ожидаем успешный XHR на /sell-orders
+      const gotSell = await page
+        .waitForResponse(
+          (res) => res.url().includes('/1.0/market/sell-orders') && res.status() === 200,
+          { timeout: 60000 }
+        )
+        .then(() => true)
+        .catch(() => false);
+      if (!gotSell) await sleep(8000);
+    } catch {}
 
     // Сохраняем куки по домену cs.money
     const cookies = await page.cookies();
     saveCookies(CFG.CSM_COOKIE_FILE, cookies);
-    const csCnt = cookies.filter(c => (c.domain || '').includes('cs.money')).length;
+    const csCnt = cookies.filter((c) => (c.domain || '').includes('cs.money')).length;
 
     LOG.info('CSM auth: cookies saved', { cs_money_cookies: csCnt, ms: Date.now() - start });
     return csCnt > 0;
@@ -150,9 +199,9 @@ export function startCsMoneyAuthLoop() {
 
   const run = async () => { await refreshCsMoneyCookies('scheduled'); };
 
-  // Если нет куков — авторизуемся сразу
   const existing = loadCookies(CFG.CSM_COOKIE_FILE);
-  if (!existing.length) run(); else LOG.info('CSM auth: existing cookies found', { count: existing.length });
+  if (!existing.length) run();
+  else LOG.info('CSM auth: existing cookies found', { count: existing.length });
 
   _authTimer = setInterval(run, minutes * 60 * 1000);
   LOG.info('CSM auth loop ON', { every_min: minutes });
@@ -164,37 +213,39 @@ export function stopCsMoneyAuthLoop() {
   LOG.info('CSM auth loop OFF');
 }
 
-// -------------------------- HTTP слой с авторековери -------------------------
+// -----------------------------------------------------------------------------
+// HTTP слой с авторековери
+// -----------------------------------------------------------------------------
 function buildHeaders() {
   const jar = loadCookies(CFG.CSM_COOKIE_FILE);
   const cookieHeader = cookieHeaderFromJar(jar, 'cs.money');
 
   return {
-    'accept': 'application/json, text/plain, */*',
-    'referer': 'https://cs.money/market/buy/',
+    accept: 'application/json, text/plain, */*',
+    referer: 'https://cs.money/market/buy/',
     'sec-ch-ua': '"Not A(Brand";v="99", "Chromium";v="121"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'x-client-app': 'web_mobile',
     'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
     'user-agent': CFG.CSM_USER_AGENT || randomUA.getRandom(),
-    ...(cookieHeader ? { 'cookie': cookieHeader } : {})
+    ...(cookieHeader ? { cookie: cookieHeader } : {}),
   };
 }
 
 async function httpGet(url, config) {
-  const doReq = async () => axios.get(url, {
-    timeout: 20000,
-    headers: buildHeaders(),
-    validateStatus: () => true,
-    ...(config || {})
-  });
+  const doReq = async () =>
+    axios.get(url, {
+      timeout: 20000,
+      headers: buildHeaders(),
+      validateStatus: () => true,
+      ...(config || {}),
+    });
 
   let res = await doReq();
 
   const looksLikeCF = (r) =>
-    r.status === 403 ||
-    (typeof r.data === 'string' && /Just a moment/i.test(r.data));
+    r.status === 403 || (typeof r.data === 'string' && /Just a moment/i.test(r.data));
 
   if (looksLikeCF(res)) {
     LOG.warn('CSM 403/CF detected → refresh cookies…');
@@ -203,26 +254,26 @@ async function httpGet(url, config) {
   }
 
   if (res.status !== 200) {
-    const body = (typeof res.data === 'string') ? res.data.slice(0, 200) : '';
+    const body = typeof res.data === 'string' ? res.data.slice(0, 200) : '';
     throw new Error(`Request failed ${res.status}: ${body}`);
   }
   return res;
 }
 
-// ------------------------------ Сканер витрины -------------------------------
+// -----------------------------------------------------------------------------
+// Сканер витрины
+// -----------------------------------------------------------------------------
 async function fetchSellOrders({ offset = 0, minPrice = 0, maxPrice = 0, sort = 'discount', order = 'desc' } = {}) {
   const res = await httpGet('https://cs.money/1.0/market/sell-orders', {
-    params: { limit: 60, offset, sort, order, minPrice, maxPrice }
+    params: { limit: 60, offset, sort, order, minPrice, maxPrice },
   });
   const items = Array.isArray(res.data?.items) ? res.data.items : [];
-  return items.map(it => ({
+  return items.map((it) => ({
     name: it?.asset?.names?.full || '',
     price: Number(it?.pricing?.computed || 0),
     img: it?.asset?.images?.steam || null,
-    // в этом эндпоинте флага locked нет — считаем false,
-    // держим в уме, что реальный трейдлок — политика Steam.
-    locked: false,
-    source_id: it?.id ? String(it.id) : null
+    locked: false, // В этом эндпоинте признака нет; трейдлок — политика Steam.
+    source_id: it?.id ? String(it.id) : null,
   }));
 }
 
@@ -237,31 +288,35 @@ export async function scanCsMoneyOnce() {
   const queue = new PQueue({ concurrency: Number(CFG.CSM_SCAN_CONCURRENCY || 3) });
   let totalItems = 0;
 
-  await Promise.all(ranges.map(([a, b]) => queue.add(async () => {
-    let offset = 0;
-    const limit = 60;
-    for (let page = 0; page < 200; page++) {
-      const list = await fetchSellOrders({ offset, minPrice: a, maxPrice: b });
-      if (!list.length) break;
-      totalItems += list.length;
+  await Promise.all(
+    ranges.map(([a, b]) =>
+      queue.add(async () => {
+        let offset = 0;
+        const limit = 60;
+        for (let page = 0; page < 200; page++) {
+          const list = await fetchSellOrders({ offset, minPrice: a, maxPrice: b });
+          if (!list.length) break;
+          totalItems += list.length;
 
-      for (const it of list) {
-        if (!it.name || !Number.isFinite(it.price)) continue;
-        upsertLiveMin({
-          name: it.name,
-          marketCode: 'csm',
-          price: it.price,
-          locked: it.locked,
-          source_id: it.source_id || null,
-          unlock_at: null
-        });
-      }
+          for (const it of list) {
+            if (!it.name || !Number.isFinite(it.price)) continue;
+            upsertLiveMin({
+              name: it.name,
+              marketCode: 'csm',
+              price: it.price,
+              locked: it.locked,
+              source_id: it.source_id || null,
+              unlock_at: null,
+            });
+          }
 
-      if (list.length < limit) break;
-      offset += limit;
-    }
-    LOG.debug('CSM range done', { a, b });
-  })));
+          if (list.length < limit) break;
+          offset += limit;
+        }
+        LOG.debug('CSM range done', { a, b });
+      })
+    )
+  );
 
   LOG.info('CS.MONEY scan finished', { totalItems, ranges: ranges.length });
 }
@@ -270,8 +325,11 @@ let _scanTimer = null;
 export function startCsMoneyLoop() {
   if (_scanTimer) return;
   const loop = async () => {
-    try { await scanCsMoneyOnce(); }
-    catch (e) { LOG.warn('CSM scan error', { msg: e.message }); }
+    try {
+      await scanCsMoneyOnce();
+    } catch (e) {
+      LOG.warn('CSM scan error', { msg: e.message });
+    }
   };
   loop(); // стартуем сразу
   _scanTimer = setInterval(loop, Math.max(5000, Number(CFG.CSM_SCAN_INTERVAL_MS || 30000)));
@@ -283,3 +341,4 @@ export function stopCsMoneyLoop() {
   _scanTimer = null;
   LOG.info('CS.MONEY loop OFF');
 }
+а
